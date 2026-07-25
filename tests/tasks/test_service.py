@@ -352,26 +352,45 @@ def test_title_update_refreshes_only_enabled_deadline_rule_messages(
     assert sent["status"] == DeliveryStatus.SENT.value
 
 
-def test_title_update_does_not_rewrite_an_enabled_deadline_rule_with_sent_delivery(
+def test_title_update_refreshes_mixed_channel_rule_without_changing_delivery_history(
     service, task_database, fixed_now
 ) -> None:
     task = service.create_task("旧标题", due_at=fixed_now + timedelta(days=2), now=fixed_now)
-    delivery = service.reminders.claim_due_deliveries(
-        DeliveryChannel.EMAIL, fixed_now + timedelta(days=1), 1
+    sent_delivery = service.reminders.claim_due_deliveries(
+        DeliveryChannel.DESKTOP, fixed_now + timedelta(days=1), 1
     )[0]
     assert service.reminders.mark_delivery_sent(
-        delivery.id, delivery.claim_token, fixed_now + timedelta(days=1)
+        sent_delivery.id, sent_delivery.claim_token, fixed_now + timedelta(days=1)
     ) is True
     with task_database.connect() as connection:
-        sent_rule_before = connection.execute(
+        rule = connection.execute(
             """
-            SELECT rule.id, rule.message, rule.updated_at
+            SELECT rule.id
             FROM reminder_rules AS rule
             JOIN reminder_occurrences AS occurrence ON occurrence.rule_id = rule.id
             JOIN notification_deliveries AS sent ON sent.occurrence_id = occurrence.id
             WHERE sent.id = ?
             """,
-            (delivery.id,),
+            (sent_delivery.id,),
+        ).fetchone()
+        sent_before = connection.execute(
+            """
+            SELECT status, sent_at, claim_token, claimed_at, next_attempt_at,
+                   attempt_count, last_error_code
+            FROM notification_deliveries WHERE id = ?
+            """,
+            (sent_delivery.id,),
+        ).fetchone()
+        pending_before = connection.execute(
+            """
+            SELECT status, sent_at, claim_token, claimed_at, next_attempt_at,
+                   attempt_count, last_error_code
+            FROM notification_deliveries
+            WHERE occurrence_id = (
+                SELECT occurrence_id FROM notification_deliveries WHERE id = ?
+            ) AND channel = ?
+            """,
+            (sent_delivery.id, DeliveryChannel.EMAIL.value),
         ).fetchone()
 
     service.update_task(
@@ -381,22 +400,38 @@ def test_title_update_does_not_rewrite_an_enabled_deadline_rule_with_sent_delive
     )
 
     with task_database.connect() as connection:
-        sent_rule_after = connection.execute(
-            "SELECT message, updated_at FROM reminder_rules WHERE id = ?",
-            (sent_rule_before["id"],),
+        rule_after = connection.execute(
+            "SELECT message FROM reminder_rules WHERE id = ?", (rule["id"],)
         ).fetchone()
-        unsent_rule = connection.execute(
+        sent_after = connection.execute(
             """
-            SELECT message FROM reminder_rules
-            WHERE task_id = ? AND id != ?
+            SELECT status, sent_at, claim_token, claimed_at, next_attempt_at,
+                   attempt_count, last_error_code
+            FROM notification_deliveries WHERE id = ?
             """,
-            (task.id, sent_rule_before["id"]),
+            (sent_delivery.id,),
         ).fetchone()
-    assert dict(sent_rule_after) == {
-        "message": sent_rule_before["message"],
-        "updated_at": sent_rule_before["updated_at"],
-    }
-    assert unsent_rule["message"] == "新标题"
+        pending_after = connection.execute(
+            """
+            SELECT status, sent_at, claim_token, claimed_at, next_attempt_at,
+                   attempt_count, last_error_code
+            FROM notification_deliveries
+            WHERE occurrence_id = (
+                SELECT occurrence_id FROM notification_deliveries WHERE id = ?
+            ) AND channel = ?
+            """,
+            (sent_delivery.id, DeliveryChannel.EMAIL.value),
+        ).fetchone()
+        event = connection.execute(
+            "SELECT before_json, after_json FROM task_events WHERE task_id = ? AND event_type = 'updated'",
+            (task.id,),
+        ).fetchone()
+    assert rule_after["message"] == "新标题"
+    assert dict(sent_after) == dict(sent_before)
+    assert dict(pending_after) == dict(pending_before)
+    assert pending_after["status"] == DeliveryStatus.PENDING.value
+    assert json.loads(event["before_json"])["title"] == "旧标题"
+    assert json.loads(event["after_json"])["title"] == "新标题"
 
 
 def test_rejects_invalid_state_transitions_with_domain_error(service, fixed_now) -> None:
