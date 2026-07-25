@@ -20,6 +20,7 @@ from app.plugins.manager import PluginManager
 from app.core.resource_manager import ResourceRegistry
 from app.tasks.service import TaskService
 from app.tasks.scheduler import ReminderScheduler
+from app.summaries.service import SummaryService
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,7 @@ class StorageServices:
     history_store: ChatHistoryStore
     visual_observation_store: VisualObservationStore
     runtime_event_log: RuntimeEventLog
+    summary_service: SummaryService | None = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +104,10 @@ class AppContext:
     @property
     def task_service(self) -> TaskService:
         return self.storage.task_service
+
+    @property
+    def summary_service(self) -> SummaryService | None:
+        return self.storage.summary_service
 
     @property
     def reminder_scheduler(self) -> ReminderScheduler:

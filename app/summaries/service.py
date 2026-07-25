@@ -38,9 +38,9 @@ class SummaryService:
         self.renderer = renderer or SummaryRenderer()
         self.snapshots = SummarySnapshotService(database, tasks)
 
-    def generate(self, *, now: datetime, provider=None) -> WeeklySummaryRun:
+    def generate(self, *, now: datetime, provider=None, snapshot_now: datetime | None = None) -> WeeklySummaryRun:
         current = ensure_utc(now)
-        snapshot = self.snapshots.build(now=current)
+        snapshot = self.snapshots.build(now=ensure_utc(snapshot_now or current))
         run_id = str(uuid.uuid4())
         draft_path = self.draft_dir / f"{snapshot.iso_year}-W{snapshot.iso_week:02d}.md"
         snapshot_path = self.snapshot_dir / f"{snapshot.iso_year}-W{snapshot.iso_week:02d}.json"
@@ -59,6 +59,13 @@ class SummaryService:
         with self.database.transaction() as connection:
             connection.execute("UPDATE weekly_summary_runs SET status=?, provider=?, snapshot_sha256=?, draft_path=?, generated_at=? WHERE id=?", (WeeklySummaryStatus.AWAITING_APPROVAL.value, provider_name, snapshot.sha256, str(draft_path), to_utc_text(current), run_id))
         return self.get(run_id)
+
+    def get_by_week(self, iso_year: int, iso_week: int) -> WeeklySummaryRun | None:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM weekly_summary_runs WHERE iso_year=? AND iso_week=?", (iso_year, iso_week)
+            ).fetchone()
+        return _run_from_row(row) if row is not None else None
 
     def publish(self, run_id: str, *, confirmed: bool, now: datetime | None = None) -> WeeklySummaryRun:
         if not confirmed:

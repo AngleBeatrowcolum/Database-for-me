@@ -11,6 +11,8 @@ from app.agent.task_tools import (
     create_task_tools,
 )
 from app.agent.tools import ToolRegistry
+from app.agent.actions import PendingToolAction
+from app.summaries.service import SummaryService
 from app.tasks.models import DeliveryStatus, ReminderOccurrenceStatus
 from app.tasks.repository import ReminderRepository, TaskRepository
 from app.tasks.service import TaskService
@@ -43,6 +45,15 @@ def test_task_tool_factory_registers_task_lifecycle_tools(task_database, fixed_n
         "task_reopen",
         "task_query",
     }
+
+
+def test_summary_publish_tool_requires_confirmation(task_database, tmp_path: Path) -> None:
+    summaries = SummaryService(task_database, TaskRepository(task_database), draft_dir=tmp_path / "drafts", snapshot_dir=tmp_path / "snapshots")
+    registry = ToolRegistry(create_task_tools(None, summary_service=summaries))
+
+    pending = registry.prepare_or_execute("weekly_summary_publish", {"run_id": "run-1"})
+
+    assert isinstance(pending, PendingToolAction)
 
 
 def test_task_entry_tools_are_visible_in_the_first_agent_tool_list(

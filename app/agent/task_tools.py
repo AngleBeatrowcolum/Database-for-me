@@ -92,8 +92,7 @@ def create_task_tools(
 ) -> list[Tool]:
     """创建任务生命周期工具；未注入服务时返回明确失败的兼容工具。"""
 
-    del summary_service
-    return [
+    tools = [
         Tool(
             name="task_create",
             description=(
@@ -182,6 +181,32 @@ def create_task_tools(
             group="default",
         ),
     ]
+    if summary_service is not None:
+        tools.extend(_summary_tools(summary_service))
+    return tools
+
+
+def _summary_tools(summary_service: object) -> list[Tool]:
+    return [
+        Tool(name="weekly_summary_get", description="查看指定周总结的状态和草稿路径。", parameters={"type": "object", "properties": {"run_id": {"type": "string"}}, "required": ["run_id"], "additionalProperties": False}, handler=lambda args: _summary_get(summary_service, args), group="default"),
+        Tool(name="weekly_summary_regenerate", description="重新生成当前周的本地周总结草稿。", parameters={"type": "object", "properties": {}, "additionalProperties": False}, handler=lambda _args: _summary_regenerate(summary_service), group="default"),
+        Tool(name="weekly_summary_publish", description="将已审阅的周总结上传到已验证的私有仓库。", parameters={"type": "object", "properties": {"run_id": {"type": "string"}}, "required": ["run_id"], "additionalProperties": False}, handler=lambda args: _summary_publish(summary_service, args), requires_confirmation=True, confirmation_risk="high", risk="high", group="default"),
+    ]
+
+
+def _summary_get(service: object, arguments: dict[str, Any]) -> dict[str, Any]:
+    run = service.get(_required_text(arguments, "run_id"))
+    return {"run_id": run.id, "status": run.status.value, "draft_path": run.draft_path}
+
+
+def _summary_regenerate(service: object) -> dict[str, Any]:
+    run = service.generate(now=datetime.now(timezone.utc))
+    return {"run_id": run.id, "status": run.status.value, "draft_path": run.draft_path}
+
+
+def _summary_publish(service: object, arguments: dict[str, Any]) -> dict[str, Any]:
+    run = service.publish(_required_text(arguments, "run_id"), confirmed=True)
+    return {"run_id": run.id, "status": run.status.value, "git_commit_sha": run.git_commit_sha}
 
 
 def create_compatibility_task_tools(

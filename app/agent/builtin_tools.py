@@ -25,6 +25,7 @@ def create_builtin_tool_registry(
     reminders: ReminderStore | None = None,
     task_service: TaskService | None = None,
     reminder_scheduler: SQLiteOneTimeReminderAdapter | None = None,
+    summary_service: object | None = None,
 ) -> ToolRegistry:
     # reminders 参数只保留调用兼容性。任务/提醒工具必须显式注入 SQLite 服务，
     # 绝不在这里为旧 JSON 文件隐式创建另一套数据源。
@@ -43,7 +44,7 @@ def create_builtin_tool_registry(
                 parameters={},
                 handler=lambda _arguments: get_current_time(),
             ),
-            *create_task_tools(task_service, reminder_scheduler),
+            *create_task_tools(task_service, reminder_scheduler, summary_service),
             *create_compatibility_task_tools(task_service, reminder_scheduler),
             Tool(
                 name="read_note",
