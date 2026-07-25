@@ -181,9 +181,13 @@ class TaskDatabase:
     def initialize(self) -> None:
         """创建并升级数据库 schema，拒绝继续使用损坏数据库。"""
 
+        existing_files = {path for path in self._database_files() if path.exists()}
+        self._check_existing_database()
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = self.connect()
+        connection: sqlite3.Connection | None = None
+        remove_new_files = False
         try:
+            connection = self.connect()
             self._raise_if_quick_check_fails(connection)
             connection.execute("PRAGMA journal_mode=WAL").fetchone()
             connection.execute("BEGIN IMMEDIATE")
@@ -209,8 +213,17 @@ class TaskDatabase:
                 connection.rollback()
                 raise
             self._raise_if_quick_check_fails(connection)
+        except DatabaseCorruptError:
+            remove_new_files = self.path not in existing_files
+            raise
+        except sqlite3.DatabaseError as exc:
+            remove_new_files = self.path not in existing_files
+            raise DatabaseCorruptError("任务数据库完整性检查失败。") from exc
         finally:
-            connection.close()
+            if connection is not None:
+                connection.close()
+            if remove_new_files:
+                self._remove_new_database_files(existing_files)
 
     @contextmanager
     def transaction(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
@@ -239,6 +252,27 @@ class TaskDatabase:
             ).fetchone()
             is not None
         )
+
+    def _check_existing_database(self) -> None:
+        if not self.path.exists():
+            return
+        try:
+            with sqlite3.connect(f"{self.path.as_uri()}?mode=ro", uri=True) as connection:
+                self._raise_if_quick_check_fails(connection)
+        except sqlite3.DatabaseError as exc:
+            raise DatabaseCorruptError("任务数据库完整性检查失败。") from exc
+
+    def _database_files(self) -> tuple[Path, Path, Path]:
+        return (
+            self.path,
+            self.path.with_name(f"{self.path.name}-wal"),
+            self.path.with_name(f"{self.path.name}-shm"),
+        )
+
+    def _remove_new_database_files(self, existing_files: set[Path]) -> None:
+        for path in self._database_files():
+            if path not in existing_files:
+                path.unlink(missing_ok=True)
 
     @staticmethod
     def _raise_if_quick_check_fails(connection: sqlite3.Connection) -> None:

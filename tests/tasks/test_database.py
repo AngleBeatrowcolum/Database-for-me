@@ -111,15 +111,20 @@ def test_initialize_raises_database_corrupt_error_when_quick_check_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     original_connect = sqlite3.connect
+    fresh_path = tmp_path / "fresh.db"
+    quick_check_results = iter(("ok", "not ok"))
 
     class QuickCheckResult:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
         def fetchone(self) -> tuple[str]:
-            return ("not ok",)
+            return (self.value,)
 
     class QuickCheckConnection(sqlite3.Connection):
         def execute(self, statement: str, parameters: object = ()):
             if statement == "PRAGMA quick_check":
-                return QuickCheckResult()
+                return QuickCheckResult(next(quick_check_results))
             return super().execute(statement, parameters)
 
     def connect(*args: object, **kwargs: object) -> sqlite3.Connection:
@@ -129,4 +134,20 @@ def test_initialize_raises_database_corrupt_error_when_quick_check_fails(
     monkeypatch.setattr(database_module.sqlite3, "connect", connect)
 
     with pytest.raises(DatabaseCorruptError):
-        TaskDatabase(tmp_path / "tasks.db").initialize()
+        TaskDatabase(fresh_path).initialize()
+
+    assert not fresh_path.exists()
+    assert not fresh_path.with_name(f"{fresh_path.name}-wal").exists()
+    assert not fresh_path.with_name(f"{fresh_path.name}-shm").exists()
+
+
+def test_initialize_preserves_existing_corrupt_database(tmp_path: Path) -> None:
+    corrupt_path = tmp_path / "corrupt.db"
+    original_bytes = b"not a sqlite database"
+    corrupt_path.write_bytes(original_bytes)
+
+    with pytest.raises(DatabaseCorruptError) as error:
+        TaskDatabase(corrupt_path).initialize()
+
+    assert isinstance(error.value.__cause__, sqlite3.DatabaseError)
+    assert corrupt_path.read_bytes() == original_bytes
