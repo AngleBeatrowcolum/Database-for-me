@@ -289,7 +289,7 @@ PRAGMA busy_timeout = 5000;
 | `id` | UUID |
 | `task_id` | 可为空；周期提醒不一定属于任务 |
 | `message` | 提醒内容 |
-| `kind` | `deadline_offset` 或 `weekly` |
+| `kind` | `deadline_offset`、`one_time` 或 `weekly` |
 | `offset_seconds` | 截止偏移，如 `-86400`、`-7200` |
 | `weekdays_mask` | 周期提醒星期位掩码 |
 | `time_of_day` | 本地时间，如 `14:00:00` |
@@ -314,6 +314,8 @@ PRAGMA busy_timeout = 5000;
 - `grace_seconds = 1800`。
 - 文字气泡、语音和 QQ 邮件。
 - 文案只提醒检查个人计划，不提供投资建议。
+
+现有 `add_reminder` 创建 `one_time` 规则，并在同一事务中直接创建一条对应的提醒实例；旧 `reminders.json` 也迁移为这种规则。一次性规则不使用 `offset_seconds`、`weekdays_mask` 或 `time_of_day`，实际触发时刻以实例的 `scheduled_at` 为准。
 
 ### 6.4 `reminder_occurrences`
 
