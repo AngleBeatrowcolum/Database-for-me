@@ -96,6 +96,30 @@ def test_task_tools_reject_unknown_scopes_and_invalid_repeated_completion(task_d
     assert "状态" in repeated.error
 
 
+def test_task_create_can_explicitly_allow_a_past_due_date_without_deadline_reminders(
+    task_database, fixed_now
+) -> None:
+    registry = _registry(task_database, fixed_now)
+    past_due = (fixed_now - timedelta(minutes=1)).isoformat()
+
+    rejected = registry.execute("task_create", {"title": "过期任务", "due_at": past_due})
+    assert not rejected.success
+    assert "确认" in rejected.error
+
+    created = registry.execute(
+        "task_create",
+        {"title": "已确认的过期任务", "due_at": past_due, "allow_past_due": True},
+    )
+
+    assert created.success
+    with task_database.connect() as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM reminder_rules WHERE task_id = ?",
+            (created.content["task"]["id"],),
+        ).fetchone()[0]
+    assert count == 0
+
+
 def test_sqlite_reminder_adapter_creates_lists_and_cancels_one_time_records(
     task_database, fixed_now
 ) -> None:
@@ -197,3 +221,17 @@ def test_deprecated_reminder_store_is_a_sqlite_facade(task_database, fixed_now) 
     assert added["reminder"]["text"] == "门面提醒"
     with task_database.connect() as connection:
         assert connection.execute("SELECT COUNT(*) FROM reminder_rules").fetchone()[0] == 1
+
+
+def test_deprecated_reminder_store_keeps_legacy_ui_polling_safe(task_database, fixed_now) -> None:
+    from app.agent import ReminderStore
+
+    _, reminder_scheduler = _services(task_database, fixed_now)
+    with pytest.deprecated_call(match="ReminderStore"):
+        store = ReminderStore(reminder_scheduler)
+
+    assert store.due_reminders() == []
+    assert store.mark_completed("old-ui-reminder") == {
+        "id": "old-ui-reminder",
+        "status": "not_scheduled",
+    }

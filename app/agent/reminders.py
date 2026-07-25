@@ -83,7 +83,11 @@ class ReminderStore:
         return self._scheduler.cancel_reminder(arguments)
 
     def due_reminders(self, *_args: object, **_kwargs: object) -> list[dict[str, Any]]:
-        raise RuntimeError("ReminderStore 已废弃；到期提醒需要后续调度器。")
+        """兼容旧 UI 轮询：Task7 尚未提供到期调度，因此不触发任何提醒。"""
 
-    def mark_completed(self, *_args: object, **_kwargs: object) -> dict[str, Any]:
-        raise RuntimeError("ReminderStore 已废弃；提醒完成状态由后续调度器维护。")
+        return []
+
+    def mark_completed(self, reminder_id: str) -> dict[str, Any]:
+        """兼容旧 UI 回调；绝不改写 SQLite 实例或任务状态。"""
+
+        return {"id": str(reminder_id), "status": "not_scheduled"}

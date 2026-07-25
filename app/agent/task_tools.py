@@ -118,6 +118,10 @@ def create_task_tools(
                         "type": ["string", "null"],
                         "description": "带时区的 ISO 截止时间。相对时间须先查询当前时间。",
                     },
+                    "allow_past_due": {
+                        "type": "boolean",
+                        "description": "仅在用户明确确认时设为 true，以创建已过期的截止时间。",
+                    },
                 },
                 "required": ["title"],
                 "additionalProperties": False,
@@ -266,7 +270,11 @@ def _create_task(
     try:
         task = service.create_task(
             _required_text(arguments, "title"),
-            **{key: arguments[key] for key in ("details", "priority", "planned_date", "due_at") if key in arguments},
+            **{
+                key: arguments[key]
+                for key in ("details", "priority", "planned_date", "due_at", "allow_past_due")
+                if key in arguments
+            },
         )
     except (TaskAssistantError, TypeError, ValueError) as exc:
         _raise_safe_task_error(exc)
