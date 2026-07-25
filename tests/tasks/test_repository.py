@@ -435,3 +435,48 @@ def test_disable_deadline_rules_uses_caller_transaction_and_keeps_other_rules(
             )
         }
     assert states == {deadline.id: 0, one_time.id: 1}
+
+
+def test_update_enabled_deadline_rule_messages_keeps_disabled_rule_history(
+    task_database, fixed_now
+) -> None:
+    tasks = TaskRepository(task_database)
+    reminders = ReminderRepository(task_database)
+    task = Task.new("旧标题", now=fixed_now, due_at=fixed_now + timedelta(days=1))
+    tasks.insert(task, event_type="created")
+    active = reminders.create_deadline_rule(task, -7200, fixed_now)
+    historical = reminders.create_deadline_rule(task, -86400, fixed_now)
+    with task_database.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE reminder_rules
+            SET enabled = 0, message = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            ("历史标题", to_utc_text(fixed_now + timedelta(seconds=1)), historical.id),
+        )
+
+    reminders.update_enabled_deadline_rule_messages_for_task(
+        task.id, "新标题", fixed_now + timedelta(minutes=1)
+    )
+
+    with task_database.connect() as connection:
+        rows = {
+            row["id"]: dict(row)
+            for row in connection.execute(
+                "SELECT id, message, enabled, updated_at FROM reminder_rules WHERE id IN (?, ?)",
+                (active.id, historical.id),
+            )
+        }
+    assert rows[active.id] == {
+        "id": active.id,
+        "message": "新标题",
+        "enabled": 1,
+        "updated_at": to_utc_text(fixed_now + timedelta(minutes=1)),
+    }
+    assert rows[historical.id] == {
+        "id": historical.id,
+        "message": "历史标题",
+        "enabled": 0,
+        "updated_at": to_utc_text(fixed_now + timedelta(seconds=1)),
+    }

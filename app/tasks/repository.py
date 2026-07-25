@@ -361,6 +361,30 @@ class ReminderRepository:
                 (to_utc_text(now), task_id, ReminderKind.DEADLINE_OFFSET.value),
             )
 
+    def update_enabled_deadline_rule_messages_for_task(
+        self,
+        task_id: str,
+        message: str,
+        now: datetime,
+        connection: sqlite3.Connection | None = None,
+    ) -> None:
+        """同步仍启用的任务截止提醒文案，不改写停用历史。"""
+
+        with _write_connection(self._database, connection) as active_connection:
+            active_connection.execute(
+                """
+                UPDATE reminder_rules
+                SET message = ?, updated_at = ?
+                WHERE task_id = ? AND kind = ? AND enabled = 1
+                """,
+                (
+                    message,
+                    to_utc_text(now),
+                    task_id,
+                    ReminderKind.DEADLINE_OFFSET.value,
+                ),
+            )
+
     def claim_due_deliveries(
         self,
         channel: DeliveryChannel,

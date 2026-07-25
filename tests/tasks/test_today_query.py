@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from zoneinfo import ZoneInfoNotFoundError
 
+import app.tasks.today_query as today_query_module
 from app.tasks.models import Priority
 from app.tasks.repository import ReminderRepository, TaskRepository
 from app.tasks.service import TaskService
@@ -114,3 +116,22 @@ def test_today_query_can_use_task_service_pending_list(task_database, fixed_now)
     result = TodayQueryService(service).query(fixed_now)
 
     assert [task.title for task in result.planned_today] == ["通过服务查询"]
+
+
+def test_today_query_uses_fixed_shanghai_fallback_without_iana_tzdata(
+    task_database, fixed_now, monkeypatch
+) -> None:
+    service, today = _services(task_database, fixed_now)
+    service.create_task("回退截止", due_at=fixed_now + timedelta(hours=1), now=fixed_now)
+
+    def unavailable(*args, **kwargs):
+        raise ZoneInfoNotFoundError("Asia/Shanghai")
+
+    monkeypatch.setattr(today_query_module, "local_date_for_utc", unavailable)
+    monkeypatch.setattr(today_query_module, "ZoneInfo", unavailable)
+
+    result = today.query(fixed_now)
+
+    assert [task.title for task in result.due_today] == ["回退截止"]
+    assert "截止 2026-07-25 13:00" in result.display_text()
+    assert "截止于2026年07月25日13:00" in result.speech_text()

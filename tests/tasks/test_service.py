@@ -182,10 +182,13 @@ def test_update_rebuilds_future_deadline_reminders_and_clears_archive(
             "SELECT before_json, after_json FROM task_events WHERE task_id = ? AND event_type = 'updated'",
             (task.id,),
         ).fetchone()
-        enabled = [
-            row["enabled"]
+        rules = [
+            dict(row)
             for row in connection.execute(
-                "SELECT enabled FROM reminder_rules WHERE task_id = ? ORDER BY created_at, id",
+                """
+                SELECT message, enabled FROM reminder_rules
+                WHERE task_id = ? ORDER BY created_at, id
+                """,
                 (task.id,),
             )
         ]
@@ -193,7 +196,12 @@ def test_update_rebuilds_future_deadline_reminders_and_clears_archive(
         (row["occurrence_status"], row["delivery_status"])
         for row in old_occurrences
     } == {("cancelled", "skipped")}
-    assert enabled == [0, 0, 1, 1]
+    assert rules == [
+        {"message": "待更新", "enabled": 0},
+        {"message": "待更新", "enabled": 0},
+        {"message": "已更新", "enabled": 1},
+        {"message": "已更新", "enabled": 1},
+    ]
     # The event preserves meaningful before/after snapshots instead of only a status marker.
     assert json.loads(event["before_json"])["title"] == "待更新"
     assert json.loads(event["after_json"])["title"] == "已更新"
@@ -297,6 +305,51 @@ def test_replacing_deadline_rules_preserves_sent_and_cancelled_history(
     assert sent["status"] == DeliveryStatus.SENT.value
     assert [row["enabled"] for row in old_rules] == [0, 0]
     assert {row["status"] for row in old_occurrences} == {"cancelled"}
+
+
+def test_title_update_refreshes_only_enabled_deadline_rule_messages(
+    service, task_database, fixed_now
+) -> None:
+    task = service.create_task("旧标题", due_at=fixed_now + timedelta(days=2), now=fixed_now)
+    delivery = service.reminders.claim_due_deliveries(
+        DeliveryChannel.EMAIL, fixed_now + timedelta(days=1), 1
+    )[0]
+    assert service.reminders.mark_delivery_sent(
+        delivery.id, delivery.claim_token, fixed_now + timedelta(days=1)
+    ) is True
+    service.update_task(
+        task.id,
+        due_at=fixed_now + timedelta(days=3),
+        now=fixed_now + timedelta(days=1, minutes=1),
+    )
+
+    service.update_task(
+        task.id,
+        title="新标题",
+        now=fixed_now + timedelta(days=1, minutes=2),
+    )
+
+    with task_database.connect() as connection:
+        rules = [
+            dict(row)
+            for row in connection.execute(
+                """
+                SELECT message, enabled FROM reminder_rules
+                WHERE task_id = ? ORDER BY created_at, id
+                """,
+                (task.id,),
+            )
+        ]
+        sent = connection.execute(
+            "SELECT status FROM notification_deliveries WHERE id = ?", (delivery.id,)
+        ).fetchone()
+    assert rules == [
+        {"message": "旧标题", "enabled": 0},
+        {"message": "旧标题", "enabled": 0},
+        {"message": "新标题", "enabled": 1},
+        {"message": "新标题", "enabled": 1},
+    ]
+    assert sent["status"] == DeliveryStatus.SENT.value
 
 
 def test_rejects_invalid_state_transitions_with_domain_error(service, fixed_now) -> None:

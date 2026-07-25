@@ -176,6 +176,13 @@ class TaskService:
             self.tasks.update(
                 updated, event_type="updated", before=before, connection=connection
             )
+            if not due_changed and updated.title != before.title:
+                self.reminders.update_enabled_deadline_rule_messages_for_task(
+                    updated.id,
+                    updated.title,
+                    occurred_at,
+                    connection=connection,
+                )
             if due_changed and updated.status is TaskStatus.PENDING:
                 self._create_default_deadline_reminders(updated, occurred_at, connection)
         return updated
