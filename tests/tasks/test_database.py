@@ -55,6 +55,23 @@ def test_initialize_is_idempotent_and_records_migration(tmp_path: Path) -> None:
     assert [row["version"] for row in versions] == [1]
 
 
+def test_initialize_supports_relative_database_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    database = TaskDatabase(Path("relative.db"))
+
+    database.initialize()
+    database.initialize()
+
+    assert Path("relative.db").exists()
+    with database.connect() as connection:
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+    assert [row["version"] for row in versions] == [1]
+
+
 def test_transaction_commits_changes(task_database: TaskDatabase) -> None:
     with task_database.transaction(immediate=True) as connection:
         connection.execute(

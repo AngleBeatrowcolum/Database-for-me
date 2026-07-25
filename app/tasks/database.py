@@ -257,7 +257,9 @@ class TaskDatabase:
         if not self.path.exists():
             return
         try:
-            with sqlite3.connect(f"{self.path.as_uri()}?mode=ro", uri=True) as connection:
+            with sqlite3.connect(
+                f"{self.path.resolve().as_uri()}?mode=ro", uri=True
+            ) as connection:
                 self._raise_if_quick_check_fails(connection)
         except sqlite3.DatabaseError as exc:
             raise DatabaseCorruptError("任务数据库完整性检查失败。") from exc
