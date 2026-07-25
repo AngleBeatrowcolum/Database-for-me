@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 
 class FakeCredentialStore:
     def __init__(self, values: dict[str, str] | None = None) -> None:
@@ -31,3 +33,27 @@ class FakeSMTP:
 
     def send_message(self, message: object) -> None:
         self.sent_messages.append(message)
+
+
+@dataclass(frozen=True)
+class RecordedRequest:
+    url: str
+    headers: dict[str, str]
+    json: dict[str, object]
+
+
+class FakeHttpTransport:
+    def __init__(self, response: dict[str, object]) -> None:
+        self.response = response
+        self.requests: list[RecordedRequest] = []
+
+    def post(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str],
+        json_body: dict[str, object],
+        timeout: int,
+    ) -> dict[str, object]:
+        self.requests.append(RecordedRequest(url, dict(headers), dict(json_body)))
+        return self.response
