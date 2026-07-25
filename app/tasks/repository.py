@@ -7,7 +7,7 @@ import sqlite3
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Iterable, Iterator
 from zoneinfo import ZoneInfo
 
@@ -1052,6 +1052,10 @@ class ReminderRepository:
                     DeliveryStatus.SENDING.value,
                 ),
             )
+            if result.rowcount == 1:
+                _settle_terminal_occurrence(
+                    active_connection, delivery_id, settled_at=sent_at
+                )
         return result.rowcount == 1
 
     def mark_delivery_failed(
@@ -1087,6 +1091,12 @@ class ReminderRepository:
                     DeliveryStatus.SENDING.value,
                 ),
             )
+            if result.rowcount == 1 and status is DeliveryStatus.FAILED:
+                _settle_terminal_occurrence(
+                    active_connection,
+                    delivery_id,
+                    settled_at=datetime.now(timezone.utc),
+                )
         return result.rowcount == 1
 
     def mark_delivery_skipped(
@@ -1112,7 +1122,96 @@ class ReminderRepository:
                     DeliveryStatus.SENDING.value,
                 ),
             )
+            if result.rowcount == 1:
+                _settle_terminal_occurrence(
+                    active_connection,
+                    delivery_id,
+                    settled_at=datetime.now(timezone.utc),
+                )
         return result.rowcount == 1
+
+
+def _settle_terminal_occurrence(
+    connection: sqlite3.Connection,
+    delivery_id: str,
+    *,
+    settled_at: datetime,
+) -> None:
+    """在最后一个渠道终结时收敛合并实例或正常完成的实例。"""
+
+    delivery_row = connection.execute(
+        "SELECT occurrence_id FROM notification_deliveries WHERE id = ?", (delivery_id,)
+    ).fetchone()
+    if delivery_row is None:
+        return
+    occurrence_id = delivery_row["occurrence_id"]
+    active_row = connection.execute(
+        """
+        SELECT 1
+        FROM notification_deliveries
+        WHERE occurrence_id = ? AND status IN (?, ?)
+        LIMIT 1
+        """,
+        (
+            occurrence_id,
+            DeliveryStatus.PENDING.value,
+            DeliveryStatus.SENDING.value,
+        ),
+    ).fetchone()
+    if active_row is not None:
+        return
+
+    now_text = to_utc_text(settled_at)
+    coalesced_row = connection.execute(
+        """
+        SELECT 1
+        FROM notification_deliveries
+        WHERE occurrence_id = ? AND last_error_code = ?
+        LIMIT 1
+        """,
+        (occurrence_id, "coalesced"),
+    ).fetchone()
+    if coalesced_row is not None:
+        connection.execute(
+            """
+            UPDATE reminder_occurrences
+            SET status = ?, skip_reason = ?, updated_at = ?
+            WHERE id = ? AND status = ?
+            """,
+            (
+                ReminderOccurrenceStatus.SKIPPED.value,
+                "coalesced",
+                now_text,
+                occurrence_id,
+                ReminderOccurrenceStatus.PENDING.value,
+            ),
+        )
+        return
+
+    non_sent_row = connection.execute(
+        """
+        SELECT 1
+        FROM notification_deliveries
+        WHERE occurrence_id = ? AND status != ?
+        LIMIT 1
+        """,
+        (occurrence_id, DeliveryStatus.SENT.value),
+    ).fetchone()
+    if non_sent_row is not None:
+        return
+    connection.execute(
+        """
+        UPDATE reminder_occurrences
+        SET status = ?, skip_reason = NULL, updated_at = ?
+        WHERE id = ? AND status = ?
+        """,
+        (
+            ReminderOccurrenceStatus.COMPLETED.value,
+            now_text,
+            occurrence_id,
+            ReminderOccurrenceStatus.PENDING.value,
+        ),
+    )
 
 
 def _task_values(task: Task) -> tuple[object, ...]:

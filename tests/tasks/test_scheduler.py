@@ -154,6 +154,96 @@ def test_email_coalescing_keeps_pending_desktop_channel_claimable(
     }
 
 
+def test_coalesced_occurrence_settles_after_other_channel_is_sent(
+    scheduler, task_service, reminders, fixed_now
+) -> None:
+    desktop_delivery, occurrence_id, claim_at = _email_coalesced_while_desktop_sending(
+        scheduler, task_service, reminders, fixed_now
+    )
+
+    assert reminders.mark_delivery_sent(
+        desktop_delivery.id,
+        desktop_delivery.claim_token,
+        claim_at + timedelta(seconds=1),
+    )
+
+    assert _occurrence_state(task_service, occurrence_id) == (
+        ReminderOccurrenceStatus.SKIPPED.value,
+        "coalesced",
+    )
+
+
+def test_coalesced_occurrence_settles_after_other_channel_permanently_fails(
+    scheduler, task_service, reminders, fixed_now
+) -> None:
+    desktop_delivery, occurrence_id, _ = _email_coalesced_while_desktop_sending(
+        scheduler, task_service, reminders, fixed_now
+    )
+
+    assert reminders.mark_delivery_failed(
+        desktop_delivery.id,
+        desktop_delivery.claim_token,
+        "permanent",
+        None,
+    )
+
+    assert _occurrence_state(task_service, occurrence_id) == (
+        ReminderOccurrenceStatus.SKIPPED.value,
+        "coalesced",
+    )
+
+
+def test_retry_pending_delivery_does_not_settle_coalesced_occurrence(
+    scheduler, task_service, reminders, fixed_now
+) -> None:
+    desktop_delivery, occurrence_id, claim_at = _email_coalesced_while_desktop_sending(
+        scheduler, task_service, reminders, fixed_now
+    )
+
+    assert reminders.mark_delivery_failed(
+        desktop_delivery.id,
+        desktop_delivery.claim_token,
+        "temporary",
+        claim_at + timedelta(minutes=10),
+    )
+
+    assert _occurrence_state(task_service, occurrence_id) == (
+        ReminderOccurrenceStatus.PENDING.value,
+        None,
+    )
+
+
+def test_normal_occurrence_completes_only_after_all_channels_are_sent(
+    scheduler, reminders, task_database, fixed_now
+) -> None:
+    rule = reminders.create_one_time_rule(
+        "双渠道正常提醒",
+        fixed_now,
+        channels=(DeliveryChannel.DESKTOP, DeliveryChannel.EMAIL),
+        now=fixed_now,
+    )
+    desktop = scheduler.claim_due("desktop", now=fixed_now, limit=1)[0]
+    email = scheduler.claim_due("email", now=fixed_now, limit=1)[0]
+
+    assert reminders.mark_delivery_sent(desktop.delivery_id, desktop.claim_token, fixed_now)
+    with task_database.connect() as connection:
+        pending = connection.execute(
+            "SELECT status FROM reminder_occurrences WHERE rule_id = ?", (rule.id,)
+        ).fetchone()
+    assert pending["status"] == ReminderOccurrenceStatus.PENDING.value
+
+    assert reminders.mark_delivery_sent(email.delivery_id, email.claim_token, fixed_now)
+    with task_database.connect() as connection:
+        completed = connection.execute(
+            "SELECT status, skip_reason FROM reminder_occurrences WHERE rule_id = ?",
+            (rule.id,),
+        ).fetchone()
+    assert dict(completed) == {
+        "status": ReminderOccurrenceStatus.COMPLETED.value,
+        "skip_reason": None,
+    }
+
+
 def test_weekly_occurrence_expires_after_thirty_minutes(scheduler) -> None:
     scheduler.ensure_stock_rule()
 
@@ -408,3 +498,43 @@ def test_prepared_delivery_keeps_original_utc_time(scheduler, reminders, fixed_n
     assert claimed[0].scheduled_at == scheduled_at
     assert to_utc_text(scheduled_at)[:16].replace("T", " ") not in claimed[0].display_text
     assert "2026-07-25 11:59" in claimed[0].display_text
+
+
+def _email_coalesced_while_desktop_sending(
+    scheduler: ReminderScheduler,
+    task_service: TaskService,
+    reminders: ReminderRepository,
+    fixed_now: datetime,
+):
+    task = task_service.create_task(
+        "跨渠道终态",
+        due_at=fixed_now + timedelta(days=1),
+        now=fixed_now - timedelta(days=2),
+    )
+    claim_at = fixed_now + timedelta(days=2)
+    desktop_delivery = reminders.claim_due_deliveries(
+        DeliveryChannel.DESKTOP, claim_at, limit=1
+    )[0]
+    email = scheduler.claim_due("email", now=claim_at, limit=10)
+    assert len(email) == 1
+    with task_service.database.connect() as connection:
+        occurrence_id = connection.execute(
+            """
+            SELECT occurrence.id
+            FROM reminder_occurrences AS occurrence
+            JOIN notification_deliveries AS desktop
+                ON desktop.occurrence_id = occurrence.id AND desktop.channel = 'desktop'
+            WHERE occurrence.task_id = ? AND desktop.id = ?
+            """,
+            (task.id, desktop_delivery.id),
+        ).fetchone()["id"]
+    return desktop_delivery, occurrence_id, claim_at
+
+
+def _occurrence_state(task_service: TaskService, occurrence_id: str) -> tuple[str, str | None]:
+    with task_service.database.connect() as connection:
+        row = connection.execute(
+            "SELECT status, skip_reason FROM reminder_occurrences WHERE id = ?",
+            (occurrence_id,),
+        ).fetchone()
+    return row["status"], row["skip_reason"]
