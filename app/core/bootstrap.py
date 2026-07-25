@@ -41,6 +41,7 @@ from app.plugins.manager import PluginManager
 from app.tasks.database import TaskDatabase
 from app.tasks.migration import LegacyJsonMigrator
 from app.tasks.repository import ReminderRepository, TaskRepository
+from app.tasks.scheduler import ReminderScheduler
 from app.tasks.service import TaskService
 
 
@@ -80,12 +81,13 @@ class TaskStorageServices:
     """启动时组装的 SQLite 任务服务；不依赖角色、UI 或后台调度。"""
 
     task_service: TaskService
-    reminder_scheduler: SQLiteOneTimeReminderAdapter
+    reminder_scheduler: ReminderScheduler
+    one_time_reminder_adapter: SQLiteOneTimeReminderAdapter
     reminder_store: ReminderStore
 
 
 def create_task_storage_services(base_dir: Path) -> TaskStorageServices:
-    """初始化 SQLite、幂等迁移旧 JSON，并组装 Task7 所需服务。"""
+    """初始化 SQLite、幂等迁移旧 JSON，并组装任务与提醒服务。"""
 
     paths = StoragePaths(base_dir)
     database = TaskDatabase(paths.tasks_database())
@@ -93,11 +95,13 @@ def create_task_storage_services(base_dir: Path) -> TaskStorageServices:
     LegacyJsonMigrator(database, legacy_data_dir=paths.data_dir).run()
     reminders = ReminderRepository(database)
     task_service = TaskService(database, TaskRepository(database), reminders)
-    reminder_scheduler = SQLiteOneTimeReminderAdapter(reminders)
+    reminder_scheduler = ReminderScheduler(reminders)
+    one_time_reminder_adapter = SQLiteOneTimeReminderAdapter(reminders)
     return TaskStorageServices(
         task_service=task_service,
         reminder_scheduler=reminder_scheduler,
-        reminder_store=ReminderStore.from_sqlite_adapter(reminder_scheduler),
+        one_time_reminder_adapter=one_time_reminder_adapter,
+        reminder_store=ReminderStore.from_sqlite_adapter(one_time_reminder_adapter),
     )
 
 
@@ -186,7 +190,7 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
         memory_store,
         task_storage.reminder_store,
         task_service=task_storage.task_service,
-        reminder_scheduler=task_storage.reminder_scheduler,
+        reminder_scheduler=task_storage.one_time_reminder_adapter,
     )
     extension_registry = ExtensionRegistry()
     extension_registry.apply_tools(tool_registry)
@@ -263,6 +267,7 @@ def build_initial_app_context(base_dir: Path, startup_state: StartupState | None
             memory_store=memory_store,
             task_service=task_storage.task_service,
             reminder_scheduler=task_storage.reminder_scheduler,
+            one_time_reminder_adapter=task_storage.one_time_reminder_adapter,
             reminder_store=task_storage.reminder_store,
             history_store=history_store,
             visual_observation_store=visual_observation_store,
@@ -331,7 +336,7 @@ def build_deferred_services(
             context.memory_store,
             context.reminder_store,
             task_service=context.task_service,
-            reminder_scheduler=context.reminder_scheduler,
+            reminder_scheduler=context.one_time_reminder_adapter,
         )
         tool_registry.set_free_access_enabled(context.tool_registry.free_access_enabled)
         extension_registry = ExtensionRegistry()

@@ -146,6 +146,7 @@ from app.plugins.events import (
     EVENT_TTS_STARTED,
 )
 from app.ui.state import PetUiState, PetUiStateStore
+from app.ui.task_reminder_bridge import TaskReminderBridge
 from app.ui.error_messages import format_failure_message
 from app.platforms.launch_at_login import (
     LaunchAtLoginError,
@@ -623,6 +624,7 @@ class PetWindow(QWidget):
         self.system_prompt = context.system_prompt
         self.memory_store = context.memory_store
         self.reminder_store = context.reminder_store
+        self.task_reminder_bridge = TaskReminderBridge(context.reminder_scheduler)
         self.tool_registry = context.tool_registry
         self.mcp_tool_provider = context.mcp_tool_provider
         self.plugin_manager = context.plugin_manager
@@ -6036,41 +6038,27 @@ class PetWindow(QWidget):
         if self.worker_thread is not None or self.active_event is not None:
             return
         try:
-            due_reminders = self.reminder_store.due_reminders()
-        except ValueError as exc:
-            log_event("Reminder", "读取失败", {"error": str(exc)})
-            log_event("Reminder", "读取失败", {"error": str(exc)})
+            prepared = self.task_reminder_bridge.poll()
+        except Exception as exc:  # noqa: BLE001 - reminder failures must not stop Sakura
+            log_event("Reminder", "领取桌面提醒失败", {"error": str(exc)})
             return
-        if not due_reminders:
+        if prepared is None:
             return
-
-        reminder = due_reminders[0]
-        reminder_id = str(reminder.get("id", ""))
-        reminder_text = str(reminder.get("text", ""))
-        reminder_trigger_at = str(reminder.get("trigger_at", ""))
-        if not reminder_id:
-            log_event("Reminder", "跳过缺少 id 的到期提醒", {"reminder": reminder})
-            return
-        log_event(
-            "Reminder",
-            "触发到期提醒",
-            {
-                "id": reminder_id,
-                "text": reminder_text,
-                "trigger_at": reminder_trigger_at,
-                "due_count": len(due_reminders),
-            },
-        )
-        self._run_event_worker(
-            AgentEvent(
-                type="reminder_due",
-                payload={
-                    "id": reminder_id,
-                    "text": reminder_text,
-                    "trigger_at": reminder_trigger_at,
-                },
+        try:
+            self._consume_agent_result(
+                AgentResult(reply=prepared.reply), record_history=False
             )
-        )
+        except Exception as exc:  # noqa: BLE001 - never report an unshown bubble as sent
+            log_event("Reminder", "展示桌面提醒失败", {"error": str(exc)})
+            try:
+                self.task_reminder_bridge.mark_failed(prepared)
+            except Exception as mark_exc:  # noqa: BLE001 - preserve UI availability
+                log_event("Reminder", "标记桌面提醒失败", {"error": str(mark_exc)})
+            return
+        try:
+            self.task_reminder_bridge.mark_shown(prepared)
+        except Exception as exc:  # noqa: BLE001 - bubble remains visible even if bookkeeping fails
+            log_event("Reminder", "确认桌面提醒已展示失败", {"error": str(exc)})
 
     def _show_reply_segments(self, segments: list[ChatSegment]) -> None:
         # 正式回复分段即将进入串行 TTS 合成队列:先让未就绪的接话预生成请求让位。

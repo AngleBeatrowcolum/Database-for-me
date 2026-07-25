@@ -26,6 +26,11 @@ def test_task_storage_bootstrap_initializes_sqlite_and_runs_legacy_migration(
     services = bootstrap.create_task_storage_services(tmp_path)
 
     assert isinstance(services.task_service, TaskService)
+    from app.agent.task_tools import SQLiteOneTimeReminderAdapter
+    from app.tasks.scheduler import ReminderScheduler
+
+    assert isinstance(services.reminder_scheduler, ReminderScheduler)
+    assert isinstance(services.one_time_reminder_adapter, SQLiteOneTimeReminderAdapter)
     assert services.task_service.database.path == tmp_path / "data" / "tasks.db"
     assert services.task_service.database.path.exists()
     assert calls == [(services.task_service.database, tmp_path / "data")]
@@ -34,6 +39,7 @@ def test_task_storage_bootstrap_initializes_sqlite_and_runs_legacy_migration(
 def test_storage_services_and_app_context_expose_task_services(task_database, fixed_now) -> None:
     from app.agent.task_tools import SQLiteOneTimeReminderAdapter
     from app.tasks.repository import ReminderRepository, TaskRepository
+    from app.tasks.scheduler import ReminderScheduler
 
     task_service = TaskService(
         task_database,
@@ -41,15 +47,18 @@ def test_storage_services_and_app_context_expose_task_services(task_database, fi
         ReminderRepository(task_database),
         clock=lambda: fixed_now,
     )
-    reminder_scheduler = SQLiteOneTimeReminderAdapter(
-        ReminderRepository(task_database), clock=lambda: fixed_now
+    reminders = ReminderRepository(task_database)
+    reminder_scheduler = ReminderScheduler(reminders, clock=lambda: fixed_now)
+    one_time_reminder_adapter = SQLiteOneTimeReminderAdapter(
+        reminders, clock=lambda: fixed_now
     )
     with pytest.deprecated_call(match="ReminderStore"):
-        reminder_store = ReminderStore(reminder_scheduler)
+        reminder_store = ReminderStore(one_time_reminder_adapter)
     storage = StorageServices(
         memory_store=object(),
         task_service=task_service,
         reminder_scheduler=reminder_scheduler,
+        one_time_reminder_adapter=one_time_reminder_adapter,
         reminder_store=reminder_store,
         history_store=object(),
         visual_observation_store=object(),
@@ -60,3 +69,4 @@ def test_storage_services_and_app_context_expose_task_services(task_database, fi
 
     assert context.task_service is task_service
     assert context.reminder_scheduler is reminder_scheduler
+    assert context.one_time_reminder_adapter is one_time_reminder_adapter

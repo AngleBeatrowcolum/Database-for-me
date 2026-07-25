@@ -19,6 +19,7 @@ from app.storage.visual_observation import VisualObservationStore
 from app.plugins.manager import PluginManager
 from app.core.resource_manager import ResourceRegistry
 from app.tasks.service import TaskService
+from app.tasks.scheduler import ReminderScheduler
 
 
 @dataclass(frozen=True)
@@ -36,7 +37,8 @@ class StorageServices:
 
     memory_store: MemoryStore
     task_service: TaskService
-    reminder_scheduler: SQLiteOneTimeReminderAdapter
+    reminder_scheduler: ReminderScheduler
+    one_time_reminder_adapter: SQLiteOneTimeReminderAdapter
     reminder_store: ReminderStore
     history_store: ChatHistoryStore
     visual_observation_store: VisualObservationStore
@@ -102,8 +104,12 @@ class AppContext:
         return self.storage.task_service
 
     @property
-    def reminder_scheduler(self) -> SQLiteOneTimeReminderAdapter:
+    def reminder_scheduler(self) -> ReminderScheduler:
         return self.storage.reminder_scheduler
+
+    @property
+    def one_time_reminder_adapter(self) -> SQLiteOneTimeReminderAdapter:
+        return self.storage.one_time_reminder_adapter
 
     @property
     def history_store(self) -> ChatHistoryStore:
