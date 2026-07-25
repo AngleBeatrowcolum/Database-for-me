@@ -6,8 +6,10 @@ import json
 import sqlite3
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Iterable, Iterator
+from zoneinfo import ZoneInfo
 
 from app.tasks.database import TaskDatabase
 from app.tasks.models import (
@@ -24,6 +26,16 @@ from app.tasks.models import (
     parse_utc,
     to_utc_text,
 )
+
+
+@dataclass(frozen=True)
+class ClaimedReminderDelivery:
+    """领取后的投递及其呈现所需的持久化上下文。"""
+
+    delivery: NotificationDelivery
+    occurrence: ReminderOccurrence
+    rule: ReminderRule
+    task: Task | None
 
 
 @contextmanager
@@ -207,6 +219,81 @@ class ReminderRepository:
 
     def __init__(self, database: TaskDatabase) -> None:
         self._database = database
+
+    @property
+    def database(self) -> TaskDatabase:
+        """提供调度服务需要的事务边界，不暴露 SQL 给调用方。"""
+
+        return self._database
+
+    def list_enabled_rules_with_tasks(
+        self, connection: sqlite3.Connection | None = None
+    ) -> list[tuple[ReminderRule, Task | None]]:
+        """列出启用规则及其任务快照，供调度器在同一事务内生成实例。"""
+
+        if connection is None:
+            with _read_connection(self._database) as active_connection:
+                return self._list_enabled_rules_with_tasks(active_connection)
+        return self._list_enabled_rules_with_tasks(connection)
+
+    @staticmethod
+    def _list_enabled_rules_with_tasks(
+        connection: sqlite3.Connection,
+    ) -> list[tuple[ReminderRule, Task | None]]:
+        rule_rows = connection.execute(
+            "SELECT * FROM reminder_rules WHERE enabled = 1 ORDER BY created_at, id"
+        ).fetchall()
+        task_ids = sorted({row["task_id"] for row in rule_rows if row["task_id"]})
+        tasks_by_id: dict[str, Task] = {}
+        if task_ids:
+            placeholders = ", ".join("?" for _ in task_ids)
+            task_rows = connection.execute(
+                f"SELECT * FROM tasks WHERE id IN ({placeholders})", tuple(task_ids)
+            ).fetchall()
+            tasks_by_id = {row["id"]: _task_from_row(row) for row in task_rows}
+        return [
+            (_rule_from_row(row), tasks_by_id.get(row["task_id"]))
+            for row in rule_rows
+        ]
+
+    def find_enabled_weekly_rule(
+        self,
+        *,
+        message: str,
+        weekdays_mask: int,
+        time_of_day: str,
+        grace_seconds: int,
+        timezone_name: str,
+        connection: sqlite3.Connection | None = None,
+    ) -> ReminderRule | None:
+        """按周期计划语义查找规则，避免并发初始化重复创建。"""
+
+        def find(active_connection: sqlite3.Connection) -> ReminderRule | None:
+            row = active_connection.execute(
+                """
+                SELECT * FROM reminder_rules
+                WHERE task_id IS NULL AND kind = ? AND message = ?
+                  AND weekdays_mask = ? AND time_of_day = ?
+                  AND grace_seconds = ? AND timezone = ?
+                  AND desktop_enabled = 1 AND email_enabled = 1 AND enabled = 1
+                ORDER BY created_at, id
+                LIMIT 1
+                """,
+                (
+                    ReminderKind.WEEKLY.value,
+                    message,
+                    weekdays_mask,
+                    time_of_day,
+                    grace_seconds,
+                    timezone_name,
+                ),
+            ).fetchone()
+            return _rule_from_row(row) if row is not None else None
+
+        if connection is None:
+            with _read_connection(self._database) as active_connection:
+                return find(active_connection)
+        return find(connection)
 
     def create_deadline_rule(
         self,
@@ -526,79 +613,411 @@ class ReminderRepository:
             ).fetchone()
         return int(row["count"]) if row is not None else 0
 
+    def recover_expired_delivery_leases(
+        self,
+        now: datetime,
+        *,
+        connection: sqlite3.Connection,
+        lease_seconds: int = 300,
+    ) -> int:
+        """将执行者崩溃后超过租约的投递恢复为待领取状态。"""
+
+        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int):
+            raise TypeError("租约秒数必须是整数。")
+        if lease_seconds <= 0:
+            raise ValueError("租约秒数必须大于零。")
+        result = connection.execute(
+            """
+            UPDATE notification_deliveries
+            SET status = ?, claim_token = NULL, claimed_at = NULL
+            WHERE status = ? AND claimed_at <= ?
+            """,
+            (
+                DeliveryStatus.PENDING.value,
+                DeliveryStatus.SENDING.value,
+                to_utc_text(now - timedelta(seconds=lease_seconds)),
+            ),
+        )
+        return result.rowcount
+
+    def expire_overdue_weekly_occurrences(
+        self, now: datetime, *, connection: sqlite3.Connection
+    ) -> tuple[str, ...]:
+        """跳过已经超过宽限期的周期实例，且绝不改写已发送渠道。"""
+
+        now_text = to_utc_text(now)
+        rows = connection.execute(
+            """
+            SELECT occurrence.id
+            FROM reminder_occurrences AS occurrence
+            JOIN reminder_rules AS rule ON rule.id = occurrence.rule_id
+            WHERE rule.kind = ? AND occurrence.status = ?
+              AND occurrence.expires_at IS NOT NULL AND occurrence.expires_at < ?
+            ORDER BY occurrence.scheduled_at, occurrence.id
+            """,
+            (
+                ReminderKind.WEEKLY.value,
+                ReminderOccurrenceStatus.PENDING.value,
+                now_text,
+            ),
+        ).fetchall()
+        occurrence_ids = tuple(row["id"] for row in rows)
+        if not occurrence_ids:
+            return ()
+
+        placeholders = ", ".join("?" for _ in occurrence_ids)
+        connection.execute(
+            f"""
+            UPDATE reminder_occurrences
+            SET status = ?, skip_reason = ?, updated_at = ?
+            WHERE id IN ({placeholders}) AND status = ?
+            """,
+            (
+                ReminderOccurrenceStatus.SKIPPED.value,
+                "expired",
+                now_text,
+                *occurrence_ids,
+                ReminderOccurrenceStatus.PENDING.value,
+            ),
+        )
+        connection.execute(
+            f"""
+            UPDATE notification_deliveries
+            SET status = ?, next_attempt_at = NULL, claimed_at = NULL,
+                claim_token = NULL, last_error_code = ?
+            WHERE occurrence_id IN ({placeholders}) AND status = ?
+            """,
+            (
+                DeliveryStatus.SKIPPED.value,
+                "expired",
+                *occurrence_ids,
+                DeliveryStatus.PENDING.value,
+            ),
+        )
+        return occurrence_ids
+
+    def coalesce_pending_deadline_deliveries(
+        self,
+        channel: DeliveryChannel,
+        now: datetime,
+        *,
+        connection: sqlite3.Connection,
+    ) -> dict[str, int]:
+        """将同一任务同一渠道的多个错过截止提醒合并为最新的一条。"""
+
+        if not isinstance(channel, DeliveryChannel):
+            raise TypeError("通知渠道必须是 DeliveryChannel。")
+        now_text = to_utc_text(now)
+        rows = connection.execute(
+            """
+            SELECT delivery.id AS delivery_id, occurrence.id AS occurrence_id,
+                   occurrence.task_id AS task_id, occurrence.scheduled_at AS scheduled_at
+            FROM notification_deliveries AS delivery
+            JOIN reminder_occurrences AS occurrence ON occurrence.id = delivery.occurrence_id
+            JOIN reminder_rules AS rule ON rule.id = occurrence.rule_id
+            WHERE delivery.channel = ? AND delivery.status = ?
+              AND occurrence.status = ? AND occurrence.task_id IS NOT NULL
+              AND occurrence.scheduled_at <= ? AND rule.kind = ?
+            ORDER BY occurrence.task_id, occurrence.scheduled_at, occurrence.id, delivery.id
+            """,
+            (
+                channel.value,
+                DeliveryStatus.PENDING.value,
+                ReminderOccurrenceStatus.PENDING.value,
+                now_text,
+                ReminderKind.DEADLINE_OFFSET.value,
+            ),
+        ).fetchall()
+        by_task: dict[str, list[sqlite3.Row]] = {}
+        for row in rows:
+            by_task.setdefault(row["task_id"], []).append(row)
+
+        coalesced: dict[str, int] = {}
+        for deliveries in by_task.values():
+            if len(deliveries) < 2:
+                continue
+            retained = deliveries[-1]
+            older = deliveries[:-1]
+            occurrence_ids = tuple(item["occurrence_id"] for item in older)
+            delivery_ids = tuple(item["delivery_id"] for item in older)
+            occurrence_placeholders = ", ".join("?" for _ in occurrence_ids)
+            delivery_placeholders = ", ".join("?" for _ in delivery_ids)
+            connection.execute(
+                f"""
+                UPDATE reminder_occurrences
+                SET status = ?, skip_reason = ?, updated_at = ?
+                WHERE id IN ({occurrence_placeholders}) AND status = ?
+                """,
+                (
+                    ReminderOccurrenceStatus.SKIPPED.value,
+                    "coalesced",
+                    now_text,
+                    *occurrence_ids,
+                    ReminderOccurrenceStatus.PENDING.value,
+                ),
+            )
+            connection.execute(
+                f"""
+                UPDATE notification_deliveries
+                SET status = ?, next_attempt_at = NULL, claimed_at = NULL,
+                    claim_token = NULL, last_error_code = ?
+                WHERE id IN ({delivery_placeholders}) AND status = ?
+                """,
+                (
+                    DeliveryStatus.SKIPPED.value,
+                    "coalesced",
+                    *delivery_ids,
+                    DeliveryStatus.PENDING.value,
+                ),
+            )
+            coalesced[retained["delivery_id"]] = len(deliveries)
+        return coalesced
+
+    def weekly_skip_reason_for_local_date(
+        self, local_day: date, timezone_name: str = "Asia/Shanghai"
+    ) -> str | None:
+        """按规则时区查找某日最新周期实例的跳过原因。"""
+
+        timezone = ZoneInfo(timezone_name)
+        local_start = datetime.combine(local_day, datetime.min.time(), tzinfo=timezone)
+        local_end = local_start + timedelta(days=1)
+        with _read_connection(self._database) as connection:
+            row = connection.execute(
+                """
+                SELECT occurrence.skip_reason
+                FROM reminder_occurrences AS occurrence
+                JOIN reminder_rules AS rule ON rule.id = occurrence.rule_id
+                WHERE rule.kind = ? AND rule.timezone = ?
+                  AND occurrence.scheduled_at >= ? AND occurrence.scheduled_at < ?
+                  AND occurrence.status = ?
+                ORDER BY occurrence.scheduled_at DESC, occurrence.id DESC
+                LIMIT 1
+                """,
+                (
+                    ReminderKind.WEEKLY.value,
+                    timezone_name,
+                    to_utc_text(local_start),
+                    to_utc_text(local_end),
+                    ReminderOccurrenceStatus.SKIPPED.value,
+                ),
+            ).fetchone()
+        return row["skip_reason"] if row is not None else None
+
+    def claimed_delivery_contexts(
+        self,
+        deliveries: Iterable[NotificationDelivery],
+        *,
+        connection: sqlite3.Connection,
+    ) -> list[ClaimedReminderDelivery]:
+        """用同一事务中的快照补齐新领取投递的规则和任务信息。"""
+
+        contexts: list[ClaimedReminderDelivery] = []
+        for delivery in deliveries:
+            delivery_row = connection.execute(
+                "SELECT * FROM notification_deliveries WHERE id = ?", (delivery.id,)
+            ).fetchone()
+            if delivery_row is None:
+                continue
+            occurrence_row = connection.execute(
+                "SELECT * FROM reminder_occurrences WHERE id = ?",
+                (delivery_row["occurrence_id"],),
+            ).fetchone()
+            if occurrence_row is None:
+                continue
+            rule_row = connection.execute(
+                "SELECT * FROM reminder_rules WHERE id = ?", (occurrence_row["rule_id"],)
+            ).fetchone()
+            if rule_row is None:
+                continue
+            task_row = None
+            if occurrence_row["task_id"] is not None:
+                task_row = connection.execute(
+                    "SELECT * FROM tasks WHERE id = ?", (occurrence_row["task_id"],)
+                ).fetchone()
+            contexts.append(
+                ClaimedReminderDelivery(
+                    delivery=_delivery_from_row(delivery_row),
+                    occurrence=_occurrence_from_row(occurrence_row),
+                    rule=_rule_from_row(rule_row),
+                    task=_task_from_row(task_row) if task_row is not None else None,
+                )
+            )
+        return contexts
+
+    def coalesced_count_for_delivery(
+        self, delivery_id: str, *, connection: sqlite3.Connection
+    ) -> int:
+        """计算自上次成功发送后，此投递代表的错过截止提醒总数。"""
+
+        row = connection.execute(
+            """
+            SELECT delivery.channel, occurrence.task_id, occurrence.scheduled_at, rule.kind
+            FROM notification_deliveries AS delivery
+            JOIN reminder_occurrences AS occurrence ON occurrence.id = delivery.occurrence_id
+            JOIN reminder_rules AS rule ON rule.id = occurrence.rule_id
+            WHERE delivery.id = ?
+            """,
+            (delivery_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["kind"] != ReminderKind.DEADLINE_OFFSET.value
+            or row["task_id"] is None
+        ):
+            return 1
+        last_sent = connection.execute(
+            """
+            SELECT MAX(previous_occurrence.scheduled_at) AS scheduled_at
+            FROM notification_deliveries AS previous_delivery
+            JOIN reminder_occurrences AS previous_occurrence
+                ON previous_occurrence.id = previous_delivery.occurrence_id
+            WHERE previous_delivery.channel = ? AND previous_delivery.status = ?
+              AND previous_occurrence.task_id = ?
+              AND previous_occurrence.scheduled_at < ?
+            """,
+            (
+                row["channel"],
+                DeliveryStatus.SENT.value,
+                row["task_id"],
+                row["scheduled_at"],
+            ),
+        ).fetchone()["scheduled_at"]
+        if last_sent is None:
+            skipped_row = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM notification_deliveries AS skipped_delivery
+                JOIN reminder_occurrences AS skipped_occurrence
+                    ON skipped_occurrence.id = skipped_delivery.occurrence_id
+                WHERE skipped_delivery.channel = ? AND skipped_delivery.status = ?
+                  AND skipped_delivery.last_error_code = ?
+                  AND skipped_occurrence.task_id = ?
+                  AND skipped_occurrence.scheduled_at < ?
+                """,
+                (
+                    row["channel"],
+                    DeliveryStatus.SKIPPED.value,
+                    "coalesced",
+                    row["task_id"],
+                    row["scheduled_at"],
+                ),
+            ).fetchone()
+        else:
+            skipped_row = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM notification_deliveries AS skipped_delivery
+                JOIN reminder_occurrences AS skipped_occurrence
+                    ON skipped_occurrence.id = skipped_delivery.occurrence_id
+                WHERE skipped_delivery.channel = ? AND skipped_delivery.status = ?
+                  AND skipped_delivery.last_error_code = ?
+                  AND skipped_occurrence.task_id = ?
+                  AND skipped_occurrence.scheduled_at > ?
+                  AND skipped_occurrence.scheduled_at < ?
+                """,
+                (
+                    row["channel"],
+                    DeliveryStatus.SKIPPED.value,
+                    "coalesced",
+                    row["task_id"],
+                    last_sent,
+                    row["scheduled_at"],
+                ),
+            ).fetchone()
+        return 1 + int(skipped_row["count"])
+
     def claim_due_deliveries(
         self,
         channel: DeliveryChannel,
         now: datetime,
         limit: int,
         lease_seconds: int = 300,
+        connection: sqlite3.Connection | None = None,
     ) -> list[NotificationDelivery]:
         if not isinstance(channel, DeliveryChannel):
             raise TypeError("通知渠道必须是 DeliveryChannel。")
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise TypeError("领取数量必须是整数。")
         if limit < 0:
             raise ValueError("领取数量不能为负数。")
         if lease_seconds <= 0:
             raise ValueError("租约秒数必须大于零。")
 
+        if connection is not None:
+            return self._claim_due_deliveries(
+                channel, now, limit, lease_seconds, connection
+            )
+        with self._database.transaction(immediate=True) as active_connection:
+            return self._claim_due_deliveries(
+                channel, now, limit, lease_seconds, active_connection
+            )
+
+    @staticmethod
+    def _claim_due_deliveries(
+        channel: DeliveryChannel,
+        now: datetime,
+        limit: int,
+        lease_seconds: int,
+        connection: sqlite3.Connection,
+    ) -> list[NotificationDelivery]:
         now_text = to_utc_text(now)
         lease_cutoff = to_utc_text(now - timedelta(seconds=lease_seconds))
-        with self._database.transaction(immediate=True) as connection:
-            connection.execute(
+        connection.execute(
+            """
+            UPDATE notification_deliveries
+            SET status = ?, claim_token = NULL, claimed_at = NULL
+            WHERE status = ? AND claimed_at <= ?
+            """,
+            (DeliveryStatus.PENDING.value, DeliveryStatus.SENDING.value, lease_cutoff),
+        )
+        rows = connection.execute(
+            """
+            SELECT delivery.*
+            FROM notification_deliveries AS delivery
+            JOIN reminder_occurrences AS occurrence
+                ON occurrence.id = delivery.occurrence_id
+            WHERE delivery.channel = ?
+              AND delivery.status = ?
+              AND (delivery.next_attempt_at IS NULL OR delivery.next_attempt_at <= ?)
+              AND occurrence.status = ?
+              AND occurrence.scheduled_at <= ?
+            ORDER BY occurrence.scheduled_at, occurrence.id, delivery.id
+            LIMIT ?
+            """,
+            (
+                channel.value,
+                DeliveryStatus.PENDING.value,
+                now_text,
+                ReminderOccurrenceStatus.PENDING.value,
+                now_text,
+                limit,
+            ),
+        ).fetchall()
+        claimed: list[NotificationDelivery] = []
+        for row in rows:
+            claim_token = str(uuid.uuid4())
+            updated = connection.execute(
                 """
                 UPDATE notification_deliveries
-                SET status = ?, claim_token = NULL, claimed_at = NULL
-                WHERE status = ? AND claimed_at <= ?
-                """,
-                (DeliveryStatus.PENDING.value, DeliveryStatus.SENDING.value, lease_cutoff),
-            )
-            rows = connection.execute(
-                """
-                SELECT delivery.*
-                FROM notification_deliveries AS delivery
-                JOIN reminder_occurrences AS occurrence
-                    ON occurrence.id = delivery.occurrence_id
-                WHERE delivery.channel = ?
-                  AND delivery.status = ?
-                  AND (delivery.next_attempt_at IS NULL OR delivery.next_attempt_at <= ?)
-                  AND occurrence.status = ?
-                  AND occurrence.scheduled_at <= ?
-                ORDER BY occurrence.scheduled_at, occurrence.id, delivery.id
-                LIMIT ?
+                SET status = ?, attempt_count = attempt_count + 1,
+                    claimed_at = ?, claim_token = ?
+                WHERE id = ? AND status = ?
                 """,
                 (
-                    channel.value,
+                    DeliveryStatus.SENDING.value,
+                    now_text,
+                    claim_token,
+                    row["id"],
                     DeliveryStatus.PENDING.value,
-                    now_text,
-                    ReminderOccurrenceStatus.PENDING.value,
-                    now_text,
-                    limit,
                 ),
-            ).fetchall()
-            claimed: list[NotificationDelivery] = []
-            for row in rows:
-                claim_token = str(uuid.uuid4())
-                updated = connection.execute(
-                    """
-                    UPDATE notification_deliveries
-                    SET status = ?, attempt_count = attempt_count + 1,
-                        claimed_at = ?, claim_token = ?
-                    WHERE id = ? AND status = ?
-                    """,
-                    (
-                        DeliveryStatus.SENDING.value,
-                        now_text,
-                        claim_token,
-                        row["id"],
-                        DeliveryStatus.PENDING.value,
-                    ),
-                )
-                if updated.rowcount != 1:
-                    continue
-                claimed_row = connection.execute(
-                    "SELECT * FROM notification_deliveries WHERE id = ?", (row["id"],)
-                ).fetchone()
-                if claimed_row is not None:
-                    claimed.append(_delivery_from_row(claimed_row))
+            )
+            if updated.rowcount != 1:
+                continue
+            claimed_row = connection.execute(
+                "SELECT * FROM notification_deliveries WHERE id = ?", (row["id"],)
+            ).fetchone()
+            if claimed_row is not None:
+                claimed.append(_delivery_from_row(claimed_row))
         return claimed
 
     def mark_delivery_sent(
