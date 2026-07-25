@@ -13,6 +13,7 @@ sqlalchemy>=2.0.31
 posthog>=4.5.0
 pytz>=2024.1
 tzdata>=2024.1
+keyring>=25.0
 protobuf>=5.29.6,<7.0.0
 sentence-transformers>=5.0.0
 py7zz>=1.1.4

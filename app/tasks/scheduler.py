@@ -43,6 +43,7 @@ class PreparedDelivery:
     task_id: str | None
     scheduled_at: datetime
     coalesced_count: int
+    attempt_count: int
     display_text: str
     speech_text: str
 
@@ -261,6 +262,7 @@ class ReminderScheduler:
             task_id=context.occurrence.task_id,
             scheduled_at=context.occurrence.scheduled_at,
             coalesced_count=coalesced_count,
+            attempt_count=delivery.attempt_count,
             display_text=display_text,
             speech_text=speech_text,
         )
