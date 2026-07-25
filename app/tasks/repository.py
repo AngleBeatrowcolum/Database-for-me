@@ -157,8 +157,22 @@ class TaskRepository:
         self, task_id: str, connection: sqlite3.Connection | None = None
     ) -> None:
         with _write_connection(self._database, connection) as active_connection:
+            row = active_connection.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                return
+            task = _task_from_row(row)
             active_connection.execute(
                 "DELETE FROM task_summary_archives WHERE task_id = ?", (task_id,)
+            )
+            _insert_task_event(
+                active_connection,
+                task_id=task.id,
+                event_type="archive_cleared",
+                before=task,
+                after=task,
+                occurred_at=task.updated_at,
             )
 
     def list_events_between(
@@ -423,9 +437,17 @@ class ReminderRepository:
         delivery_id: str,
         claim_token: str,
         error_code: str,
-        next_attempt_at: datetime,
+        next_attempt_at: datetime | None,
         connection: sqlite3.Connection | None = None,
     ) -> bool:
+        next_attempt_text = (
+            to_utc_text(next_attempt_at) if next_attempt_at is not None else None
+        )
+        status = (
+            DeliveryStatus.PENDING
+            if next_attempt_text is not None
+            else DeliveryStatus.FAILED
+        )
         with _write_connection(self._database, connection) as active_connection:
             result = active_connection.execute(
                 """
@@ -435,8 +457,8 @@ class ReminderRepository:
                 WHERE id = ? AND claim_token = ? AND status = ?
                 """,
                 (
-                    DeliveryStatus.FAILED.value,
-                    to_utc_text(next_attempt_at),
+                    status.value,
+                    next_attempt_text,
                     error_code,
                     delivery_id,
                     claim_token,

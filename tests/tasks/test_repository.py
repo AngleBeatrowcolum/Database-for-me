@@ -120,6 +120,13 @@ def test_task_update_audits_canonical_json_and_queries_in_order(
         assert connection.execute(
             "SELECT 1 FROM task_summary_archives WHERE task_id = ?", (updated.id,)
         ).fetchone() is None
+    archive_event = next(
+        event
+        for event in tasks.list_events_between(fixed_now, fixed_now + timedelta(hours=1))
+        if event["event_type"] == "archive_cleared"
+    )
+    assert archive_event["before_json"] == archive_event["after_json"]
+    assert json.loads(archive_event["after_json"])["title"] == "中文已更新"
 
 
 def test_rules_create_expected_occurrences_and_channel_deliveries(
@@ -234,11 +241,50 @@ def test_delivery_leases_recover_and_reject_wrong_token(task_database, fixed_now
             (delivery.id,),
         ).fetchone()
     assert dict(failed) == {
-        "status": "failed",
+        "status": "pending",
         "claim_token": None,
         "claimed_at": None,
         "last_error_code": "smtp_timeout",
         "next_attempt_at": to_utc_text(fixed_now + timedelta(minutes=8)),
+    }
+
+
+def test_temporary_failures_retry_at_next_attempt_but_permanent_failures_do_not(
+    task_database, fixed_now
+) -> None:
+    reminders = ReminderRepository(task_database)
+    reminders.create_one_time_rule(
+        "重试提醒", fixed_now, {DeliveryChannel.DESKTOP}, fixed_now
+    )
+
+    initial = reminders.claim_due_deliveries(DeliveryChannel.DESKTOP, fixed_now, 1)[0]
+    next_attempt = fixed_now + timedelta(minutes=10)
+    assert reminders.mark_delivery_failed(
+        initial.id, initial.claim_token, "temporary", next_attempt
+    ) is True
+    assert reminders.claim_due_deliveries(
+        DeliveryChannel.DESKTOP, next_attempt - timedelta(seconds=1), 1
+    ) == []
+
+    retried = reminders.claim_due_deliveries(DeliveryChannel.DESKTOP, next_attempt, 1)
+    assert [delivery.id for delivery in retried] == [initial.id]
+    assert retried[0].attempt_count == 2
+    assert reminders.mark_delivery_failed(
+        retried[0].id, retried[0].claim_token, "permanent", None
+    ) is True
+    assert reminders.claim_due_deliveries(
+        DeliveryChannel.DESKTOP, next_attempt + timedelta(days=1), 1
+    ) == []
+    with task_database.connect() as connection:
+        permanent = connection.execute(
+            "SELECT status, next_attempt_at, last_error_code "
+            "FROM notification_deliveries WHERE id = ?",
+            (initial.id,),
+        ).fetchone()
+    assert dict(permanent) == {
+        "status": "failed",
+        "next_attempt_at": None,
+        "last_error_code": "permanent",
     }
 
 
