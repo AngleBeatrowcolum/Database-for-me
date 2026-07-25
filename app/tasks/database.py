@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
 from app.tasks.errors import DatabaseCorruptError
+
+
+_SQLITE_TIMEOUT_SECONDS = 5.0
+_INITIALIZATION_LOCK_SUFFIX = ".init.lock"
+_LOCK_POLL_INTERVAL_SECONDS = 0.05
 
 
 _CREATE_SCHEMA_MIGRATIONS = """
@@ -172,7 +179,7 @@ class TaskDatabase:
     def connect(self) -> sqlite3.Connection:
         """创建已启用外键检查的数据库连接。"""
 
-        connection = sqlite3.connect(self.path, timeout=5.0)
+        connection = sqlite3.connect(self.path, timeout=_SQLITE_TIMEOUT_SECONDS)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=5000")
@@ -181,49 +188,72 @@ class TaskDatabase:
     def initialize(self) -> None:
         """创建并升级数据库 schema，拒绝继续使用损坏数据库。"""
 
-        existing_files = {path for path in self._database_files() if path.exists()}
-        self._check_existing_database()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        lock_descriptor: int | None = None
         connection: sqlite3.Connection | None = None
-        remove_new_files = False
+        created_by_this_call = False
+        failed = False
+        existing_files: set[Path] = set()
         try:
-            connection = self.connect()
-            self._raise_if_quick_check_fails(connection)
-            connection.execute("PRAGMA journal_mode=WAL").fetchone()
-            connection.execute("BEGIN IMMEDIATE")
+            lock_descriptor = self._acquire_initialization_lock()
+            existing_files = {path for path in self._database_files() if path.exists()}
             try:
-                if not self._schema_migrations_exists(connection):
-                    connection.execute(_CREATE_SCHEMA_MIGRATIONS)
+                database_descriptor = os.open(
+                    self.path, os.O_CREAT | os.O_EXCL | os.O_RDWR
+                )
+            except FileExistsError:
+                self._check_existing_database()
+            else:
+                created_by_this_call = True
+                os.close(database_descriptor)
 
-                applied_versions = {
-                    row["version"]
-                    for row in connection.execute("SELECT version FROM schema_migrations")
-                }
-                for version, statements in _MIGRATIONS:
-                    if version in applied_versions:
-                        continue
-                    for statement in statements:
-                        connection.execute(statement)
-                    connection.execute(
-                        "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-                        (version, _utc_timestamp()),
-                    )
-                connection.commit()
-            except BaseException:
-                connection.rollback()
+            try:
+                connection = self.connect()
+                self._raise_if_quick_check_fails(connection)
+                connection.execute("PRAGMA journal_mode=WAL").fetchone()
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    if not self._schema_migrations_exists(connection):
+                        connection.execute(_CREATE_SCHEMA_MIGRATIONS)
+
+                    applied_versions = {
+                        row["version"]
+                        for row in connection.execute("SELECT version FROM schema_migrations")
+                    }
+                    for version, statements in _MIGRATIONS:
+                        if version in applied_versions:
+                            continue
+                        for statement in statements:
+                            connection.execute(statement)
+                        connection.execute(
+                            "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                            (version, _utc_timestamp()),
+                        )
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
+                self._raise_if_quick_check_fails(connection)
+            except sqlite3.OperationalError:
                 raise
-            self._raise_if_quick_check_fails(connection)
-        except DatabaseCorruptError:
-            remove_new_files = self.path not in existing_files
+            except sqlite3.DatabaseError as exc:
+                if self._is_corruption_error(exc):
+                    raise DatabaseCorruptError("任务数据库完整性检查失败。") from exc
+                raise
+        except BaseException:
+            failed = True
             raise
-        except sqlite3.DatabaseError as exc:
-            remove_new_files = self.path not in existing_files
-            raise DatabaseCorruptError("任务数据库完整性检查失败。") from exc
         finally:
-            if connection is not None:
-                connection.close()
-            if remove_new_files:
-                self._remove_new_database_files(existing_files)
+            try:
+                if connection is not None:
+                    connection.close()
+            finally:
+                try:
+                    if failed and created_by_this_call:
+                        self._remove_new_database_files(existing_files)
+                finally:
+                    if lock_descriptor is not None:
+                        self._release_initialization_lock(lock_descriptor)
 
     @contextmanager
     def transaction(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
@@ -256,13 +286,43 @@ class TaskDatabase:
     def _check_existing_database(self) -> None:
         if not self.path.exists():
             return
+        connection: sqlite3.Connection | None = None
         try:
-            with sqlite3.connect(
-                f"{self.path.resolve().as_uri()}?mode=ro", uri=True
-            ) as connection:
-                self._raise_if_quick_check_fails(connection)
+            connection = sqlite3.connect(
+                f"{self.path.resolve().as_uri()}?mode=ro",
+                timeout=_SQLITE_TIMEOUT_SECONDS,
+                uri=True,
+            )
+            self._raise_if_quick_check_fails(connection)
+        except sqlite3.OperationalError:
+            raise
         except sqlite3.DatabaseError as exc:
-            raise DatabaseCorruptError("任务数据库完整性检查失败。") from exc
+            if self._is_corruption_error(exc):
+                raise DatabaseCorruptError("任务数据库完整性检查失败。") from exc
+            raise
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def _acquire_initialization_lock(self) -> int:
+        deadline = time.monotonic() + _SQLITE_TIMEOUT_SECONDS
+        lock_path = self._initialization_lock_path()
+        while True:
+            try:
+                return os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            except FileExistsError:
+                if time.monotonic() >= deadline:
+                    raise sqlite3.OperationalError("任务数据库初始化正在进行中。")
+                time.sleep(_LOCK_POLL_INTERVAL_SECONDS)
+
+    def _release_initialization_lock(self, descriptor: int) -> None:
+        try:
+            os.close(descriptor)
+        finally:
+            self._initialization_lock_path().unlink(missing_ok=True)
+
+    def _initialization_lock_path(self) -> Path:
+        return self.path.with_name(f"{self.path.name}{_INITIALIZATION_LOCK_SUFFIX}")
 
     def _database_files(self) -> tuple[Path, Path, Path]:
         return (
@@ -275,6 +335,19 @@ class TaskDatabase:
         for path in self._database_files():
             if path not in existing_files:
                 path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _is_corruption_error(error: sqlite3.DatabaseError) -> bool:
+        message = str(error).lower()
+        return any(
+            marker in message
+            for marker in (
+                "file is not a database",
+                "file is encrypted or is not a database",
+                "database disk image is malformed",
+                "malformed database schema",
+            )
+        )
 
     @staticmethod
     def _raise_if_quick_check_fails(connection: sqlite3.Connection) -> None:

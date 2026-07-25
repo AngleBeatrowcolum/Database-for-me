@@ -1,4 +1,5 @@
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -70,6 +71,130 @@ def test_initialize_supports_relative_database_paths(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
     assert [row["version"] for row in versions] == [1]
+
+
+def test_failed_initializer_does_not_delete_other_initializer_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "tasks.db"
+    initialization_lock_path = database_path.with_name(f"{database_path.name}.init.lock")
+    first_database = TaskDatabase(database_path)
+    second_database = TaskDatabase(database_path)
+    original_quick_check = TaskDatabase._raise_if_quick_check_fails
+    first_ready_to_fail = threading.Event()
+    allow_first_failure = threading.Event()
+    second_started = threading.Event()
+    second_finished = threading.Event()
+    first_errors: list[BaseException] = []
+    second_errors: list[BaseException] = []
+    first_calls = 0
+    original_connect = sqlite3.connect
+
+    class CloseOnExitConnection(sqlite3.Connection):
+        def __exit__(self, exc_type, exc_value, traceback):
+            try:
+                return super().__exit__(exc_type, exc_value, traceback)
+            finally:
+                self.close()
+
+    def connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        kwargs["factory"] = CloseOnExitConnection
+        return original_connect(*args, **kwargs)
+
+    def controlled_quick_check(connection: sqlite3.Connection) -> None:
+        nonlocal first_calls
+        if threading.current_thread().name == "initializer-a":
+            first_calls += 1
+            if first_calls == 2:
+                first_ready_to_fail.set()
+                assert allow_first_failure.wait(timeout=2)
+                raise DatabaseCorruptError("force first initializer failure")
+        original_quick_check(connection)
+
+    monkeypatch.setattr(
+        TaskDatabase,
+        "_raise_if_quick_check_fails",
+        staticmethod(controlled_quick_check),
+    )
+    monkeypatch.setattr(database_module.sqlite3, "connect", connect)
+
+    def run_first() -> None:
+        try:
+            first_database.initialize()
+        except BaseException as exc:
+            first_errors.append(exc)
+
+    def run_second() -> None:
+        second_started.set()
+        try:
+            second_database.initialize()
+        except BaseException as exc:
+            second_errors.append(exc)
+        finally:
+            second_finished.set()
+
+    first_thread = threading.Thread(target=run_first, name="initializer-a")
+    second_thread = threading.Thread(target=run_second, name="initializer-b")
+    first_thread.start()
+    assert first_ready_to_fail.wait(timeout=2)
+    second_thread.start()
+    assert second_started.wait(timeout=2)
+    if not initialization_lock_path.exists():
+        assert second_finished.wait(timeout=2)
+    allow_first_failure.set()
+    first_thread.join(timeout=2)
+    second_thread.join(timeout=2)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert len(first_errors) == 1
+    if second_errors:
+        assert len(second_errors) == 1
+        assert isinstance(second_errors[0], sqlite3.OperationalError)
+        second_database.initialize()
+    with second_database.connect() as connection:
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+    assert [row["version"] for row in versions] == [1]
+
+
+def test_initialize_cleans_fresh_database_when_quick_check_is_interrupted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "interrupted.db"
+
+    def interrupt_quick_check(connection: sqlite3.Connection) -> None:
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(
+        TaskDatabase,
+        "_raise_if_quick_check_fails",
+        staticmethod(interrupt_quick_check),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        TaskDatabase(database_path).initialize()
+
+    assert not database_path.exists()
+    assert not database_path.with_name(f"{database_path.name}-wal").exists()
+    assert not database_path.with_name(f"{database_path.name}-shm").exists()
+
+
+def test_initialize_keeps_locked_database_error_retryable(tmp_path: Path) -> None:
+    database = TaskDatabase(tmp_path / "tasks.db")
+    database.initialize()
+    lock_connection = sqlite3.connect(database.path, timeout=0.1)
+    try:
+        lock_connection.execute("BEGIN EXCLUSIVE")
+        with pytest.raises(sqlite3.OperationalError) as error:
+            database.initialize()
+    finally:
+        lock_connection.rollback()
+        lock_connection.close()
+
+    assert not isinstance(error.value, DatabaseCorruptError)
+    assert database.integrity_check()
 
 
 def test_transaction_commits_changes(task_database: TaskDatabase) -> None:
@@ -168,3 +293,28 @@ def test_initialize_preserves_existing_corrupt_database(tmp_path: Path) -> None:
 
     assert isinstance(error.value.__cause__, sqlite3.DatabaseError)
     assert corrupt_path.read_bytes() == original_bytes
+
+
+def test_initialize_closes_readonly_connection_for_corrupt_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    corrupt_path = tmp_path / "corrupt.db"
+    corrupt_path.write_bytes(b"not a sqlite database")
+    original_connect = sqlite3.connect
+    closed_connections: list[sqlite3.Connection] = []
+
+    class TrackingConnection(sqlite3.Connection):
+        def close(self) -> None:
+            closed_connections.append(self)
+            super().close()
+
+    def connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        kwargs["factory"] = TrackingConnection
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(database_module.sqlite3, "connect", connect)
+
+    with pytest.raises(DatabaseCorruptError):
+        TaskDatabase(corrupt_path).initialize()
+
+    assert len(closed_connections) == 1
