@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from dataclasses import replace
 from datetime import timedelta
 
@@ -13,6 +14,7 @@ from app.tasks.models import (
     Task,
     to_utc_text,
 )
+from app.tasks.database import TaskDatabase
 from app.tasks.repository import ReminderRepository, TaskRepository
 
 
@@ -286,6 +288,71 @@ def test_temporary_failures_retry_at_next_attempt_but_permanent_failures_do_not(
         "next_attempt_at": None,
         "last_error_code": "permanent",
     }
+
+
+def test_claim_uses_canonical_time_boundaries_for_leases_and_retries(
+    task_database, fixed_now
+) -> None:
+    reminders = ReminderRepository(task_database)
+    reminders.create_one_time_rule(
+        "边界提醒", fixed_now, {DeliveryChannel.DESKTOP}, fixed_now
+    )
+
+    first = reminders.claim_due_deliveries(DeliveryChannel.DESKTOP, fixed_now, 1)[0]
+    lease_expires_at = fixed_now + timedelta(seconds=300)
+    recovered = reminders.claim_due_deliveries(
+        DeliveryChannel.DESKTOP, lease_expires_at, 1
+    )
+    assert [delivery.id for delivery in recovered] == [first.id]
+    assert recovered[0].claim_token != first.claim_token
+
+    next_attempt = lease_expires_at + timedelta(microseconds=500_000)
+    assert reminders.mark_delivery_failed(
+        recovered[0].id, recovered[0].claim_token, "temporary", next_attempt
+    ) is True
+    assert reminders.claim_due_deliveries(
+        DeliveryChannel.DESKTOP, lease_expires_at, 1
+    ) == []
+    assert [delivery.id for delivery in reminders.claim_due_deliveries(
+        DeliveryChannel.DESKTOP, next_attempt, 1
+    )] == [first.id]
+
+
+def test_repository_reads_close_connections_before_database_file_changes(
+    tmp_path, fixed_now, monkeypatch
+) -> None:
+    database_path = tmp_path / "read-close.db"
+    database = TaskDatabase(database_path)
+    database.initialize()
+    tasks = TaskRepository(database)
+    reminders = ReminderRepository(database)
+    task = Task.new("关闭连接", now=fixed_now)
+    tasks.insert(task, event_type="created")
+
+    original_connect = database.connect
+    opened_connections: list[sqlite3.Connection] = []
+
+    def retain_connection() -> sqlite3.Connection:
+        connection = original_connect()
+        opened_connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(database, "connect", retain_connection)
+    try:
+        assert tasks.get(task.id) == task
+        assert tasks.find_pending_by_exact_title(task.title) == [task]
+        assert tasks.list_pending() == [task]
+        assert [event["event_type"] for event in tasks.list_events_between(
+            fixed_now, fixed_now
+        )] == ["created"]
+        assert reminders.claim_due_deliveries(DeliveryChannel.EMAIL, fixed_now, 1) == []
+
+        renamed_path = tmp_path / "renamed.db"
+        database_path.rename(renamed_path)
+        renamed_path.unlink()
+    finally:
+        for connection in opened_connections:
+            connection.close()
 
 
 def test_cancel_pending_task_reminders_and_caller_transaction_rollback(

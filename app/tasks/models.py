@@ -72,7 +72,7 @@ def ensure_utc(value: datetime) -> datetime:
 def to_utc_text(value: datetime) -> str:
     """将带时区时间转为可持久化的 UTC ISO 文本。"""
 
-    return ensure_utc(value).isoformat().replace("+00:00", "Z")
+    return ensure_utc(value).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def parse_utc(value: str) -> datetime:

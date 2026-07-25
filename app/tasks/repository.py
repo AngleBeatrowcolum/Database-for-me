@@ -39,6 +39,17 @@ def _write_connection(
         yield owned_connection
 
 
+@contextmanager
+def _read_connection(database: TaskDatabase) -> Iterator[sqlite3.Connection]:
+    """在只读查询完成后显式关闭 SQLite 连接。"""
+
+    connection = database.connect()
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
 class TaskRepository:
     """保存不可变任务模型及其审计事件。"""
 
@@ -72,14 +83,14 @@ class TaskRepository:
         return task
 
     def get(self, task_id: str) -> Task | None:
-        with self._database.connect() as connection:
+        with _read_connection(self._database) as connection:
             row = connection.execute(
                 "SELECT * FROM tasks WHERE id = ?", (task_id,)
             ).fetchone()
         return _task_from_row(row) if row is not None else None
 
     def find_pending_by_exact_title(self, title: str) -> list[Task]:
-        with self._database.connect() as connection:
+        with _read_connection(self._database) as connection:
             rows = connection.execute(
                 """
                 SELECT * FROM tasks
@@ -91,7 +102,7 @@ class TaskRepository:
         return [_task_from_row(row) for row in rows]
 
     def list_pending(self) -> list[Task]:
-        with self._database.connect() as connection:
+        with _read_connection(self._database) as connection:
             rows = connection.execute(
                 """
                 SELECT * FROM tasks
@@ -178,7 +189,7 @@ class TaskRepository:
     def list_events_between(
         self, start: datetime, end: datetime
     ) -> list[dict[str, object]]:
-        with self._database.connect() as connection:
+        with _read_connection(self._database) as connection:
             rows = connection.execute(
                 """
                 SELECT id, task_id, event_type, before_json, after_json, occurred_at
@@ -353,7 +364,7 @@ class ReminderRepository:
                 """
                 UPDATE notification_deliveries
                 SET status = ?, claim_token = NULL, claimed_at = NULL
-                WHERE status = ? AND claimed_at < ?
+                WHERE status = ? AND claimed_at <= ?
                 """,
                 (DeliveryStatus.PENDING.value, DeliveryStatus.SENDING.value, lease_cutoff),
             )

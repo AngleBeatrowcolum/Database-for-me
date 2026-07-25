@@ -165,6 +165,17 @@ def test_utc_helpers_normalize_aware_datetimes_and_reject_naive() -> None:
         ensure_utc(datetime(2026, 7, 25, 4, 0))
 
 
+def test_utc_text_is_fixed_width_and_orders_fractional_seconds() -> None:
+    whole_second = datetime(2026, 7, 25, 4, 0, tzinfo=timezone.utc)
+    half_second_later = whole_second + timedelta(microseconds=500_000)
+
+    assert to_utc_text(whole_second) == "2026-07-25T04:00:00.000000Z"
+    assert to_utc_text(half_second_later) == "2026-07-25T04:00:00.500000Z"
+    assert to_utc_text(whole_second) < to_utc_text(half_second_later)
+    assert parse_utc(to_utc_text(whole_second)) == whole_second
+    assert parse_utc(to_utc_text(half_second_later)) == half_second_later
+
+
 def test_reminder_occurrence_normalizes_datetimes_and_rejects_naive() -> None:
     local_time = datetime(2026, 7, 25, 12, 0, tzinfo=timezone(timedelta(hours=8)))
     occurrence = ReminderOccurrence(
