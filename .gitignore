@@ -1,0 +1,61 @@
+# Sakura 的本地运行时（由发行包或 install.bat 准备）
+/runtime/
+
+# 个人数据与本地配置
+# 包含聊天记录、记忆、任务、提醒、日志、缓存及插件用户配置。
+/data/
+
+# 本地密钥与环境变量
+/.env
+/.env.*
+!/.env.example
+/credentials*.json
+/secrets*.json
+*.pem
+*.key
+
+# 本地数据库
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Python 生成文件与虚拟环境
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Rust、Tauri 与前端构建产物
+target/
+node_modules/
+build/
+dist/
+
+# Playwright 测试产物
+playwright-report/
+test-results/
+
+# 临时文件与运行日志
+*.log
+*.tmp
+*.pid
+
+# 编辑器与操作系统文件
+.idea/
+.vscode/
+*.code-workspace
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# 头脑风暴可视化临时内容
+/.superpowers/
