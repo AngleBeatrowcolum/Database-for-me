@@ -87,7 +87,7 @@ def test_scheduler_coalesces_missed_deadline_offsets(
             (task.id, DeliveryChannel.EMAIL.value),
         ).fetchall()
     assert [(row["occurrence_status"], row["skip_reason"]) for row in rows] == [
-        (ReminderOccurrenceStatus.SKIPPED.value, "coalesced"),
+        (ReminderOccurrenceStatus.PENDING.value, None),
         (ReminderOccurrenceStatus.PENDING.value, None),
     ]
     assert [row["delivery_status"] for row in rows] == [
@@ -95,6 +95,63 @@ def test_scheduler_coalesces_missed_deadline_offsets(
         DeliveryStatus.SENDING.value,
     ]
     assert rows[0]["last_error_code"] == "coalesced"
+
+
+def test_email_coalescing_keeps_pending_desktop_channel_claimable(
+    scheduler, task_service, fixed_now
+) -> None:
+    task = task_service.create_task(
+        "双渠道补发",
+        due_at=fixed_now + timedelta(days=1),
+        now=fixed_now - timedelta(days=2),
+    )
+    claim_at = fixed_now + timedelta(days=2)
+
+    email = scheduler.claim_due("email", now=claim_at, limit=10)
+
+    assert len(email) == 1
+    assert email[0].coalesced_count == 2
+    with task_service.database.connect() as connection:
+        older = connection.execute(
+            """
+            SELECT occurrence.status AS occurrence_status,
+                   email.status AS email_status,
+                   desktop.status AS desktop_status
+            FROM reminder_occurrences AS occurrence
+            JOIN notification_deliveries AS email
+                ON email.occurrence_id = occurrence.id AND email.channel = 'email'
+            JOIN notification_deliveries AS desktop
+                ON desktop.occurrence_id = occurrence.id AND desktop.channel = 'desktop'
+            WHERE occurrence.task_id = ?
+            ORDER BY occurrence.scheduled_at
+            LIMIT 1
+            """,
+            (task.id,),
+        ).fetchone()
+    assert dict(older) == {
+        "occurrence_status": ReminderOccurrenceStatus.PENDING.value,
+        "email_status": DeliveryStatus.SKIPPED.value,
+        "desktop_status": DeliveryStatus.PENDING.value,
+    }
+
+    desktop = scheduler.claim_due("desktop", now=claim_at, limit=10)
+
+    assert len(desktop) == 1
+    assert desktop[0].coalesced_count == 2
+    with task_service.database.connect() as connection:
+        final_occurrence = connection.execute(
+            """
+            SELECT status, skip_reason FROM reminder_occurrences
+            WHERE task_id = ?
+            ORDER BY scheduled_at
+            LIMIT 1
+            """,
+            (task.id,),
+        ).fetchone()
+    assert dict(final_occurrence) == {
+        "status": ReminderOccurrenceStatus.SKIPPED.value,
+        "skip_reason": "coalesced",
+    }
 
 
 def test_weekly_occurrence_expires_after_thirty_minutes(scheduler) -> None:

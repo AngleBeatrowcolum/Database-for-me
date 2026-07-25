@@ -744,20 +744,6 @@ class ReminderRepository:
             delivery_placeholders = ", ".join("?" for _ in delivery_ids)
             connection.execute(
                 f"""
-                UPDATE reminder_occurrences
-                SET status = ?, skip_reason = ?, updated_at = ?
-                WHERE id IN ({occurrence_placeholders}) AND status = ?
-                """,
-                (
-                    ReminderOccurrenceStatus.SKIPPED.value,
-                    "coalesced",
-                    now_text,
-                    *occurrence_ids,
-                    ReminderOccurrenceStatus.PENDING.value,
-                ),
-            )
-            connection.execute(
-                f"""
                 UPDATE notification_deliveries
                 SET status = ?, next_attempt_at = NULL, claimed_at = NULL,
                     claim_token = NULL, last_error_code = ?
@@ -768,6 +754,29 @@ class ReminderRepository:
                     "coalesced",
                     *delivery_ids,
                     DeliveryStatus.PENDING.value,
+                ),
+            )
+            connection.execute(
+                f"""
+                UPDATE reminder_occurrences AS occurrence
+                SET status = ?, skip_reason = ?, updated_at = ?
+                WHERE occurrence.id IN ({occurrence_placeholders})
+                  AND occurrence.status = ?
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM notification_deliveries AS remaining_delivery
+                      WHERE remaining_delivery.occurrence_id = occurrence.id
+                        AND remaining_delivery.status IN (?, ?)
+                  )
+                """,
+                (
+                    ReminderOccurrenceStatus.SKIPPED.value,
+                    "coalesced",
+                    now_text,
+                    *occurrence_ids,
+                    ReminderOccurrenceStatus.PENDING.value,
+                    DeliveryStatus.PENDING.value,
+                    DeliveryStatus.SENDING.value,
                 ),
             )
             coalesced[retained["delivery_id"]] = len(deliveries)
