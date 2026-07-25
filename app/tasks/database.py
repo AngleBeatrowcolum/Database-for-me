@@ -270,8 +270,11 @@ class TaskDatabase:
 
     def integrity_check(self, path: Path | None = None) -> bool:
         target = path or self.path
-        with sqlite3.connect(target) as connection:
+        connection = sqlite3.connect(target)
+        try:
             return connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        finally:
+            connection.close()
 
     @staticmethod
     def _schema_migrations_exists(connection: sqlite3.Connection) -> bool:

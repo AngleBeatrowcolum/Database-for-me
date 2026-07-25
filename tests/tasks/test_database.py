@@ -249,6 +249,18 @@ def test_integrity_check_supports_default_and_override_paths(tmp_path: Path) -> 
     assert database.integrity_check(other_database.path)
 
 
+def test_integrity_check_closes_database_connection(tmp_path: Path) -> None:
+    database_path = tmp_path / "tasks.db"
+    database = TaskDatabase(database_path)
+    database.initialize()
+
+    assert database.integrity_check()
+
+    renamed_path = tmp_path / "renamed.db"
+    database_path.replace(renamed_path)
+    assert renamed_path.exists()
+
+
 def test_initialize_raises_database_corrupt_error_when_quick_check_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
