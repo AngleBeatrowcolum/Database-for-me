@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from app.agent import AgentRuntime, MemoryStore, ReminderStore, ToolRegistry
+from app.agent.task_tools import SQLiteOneTimeReminderAdapter
 from app.agent.mcp import MCPRuntimeSettings, MCPToolProvider
 from app.agent.memory_curator import MemoryCurator, MemoryCurationSettings, MemoryCurationState
 from app.config.settings_service import AppSettingsService, DebugLogSettings, StartupSettings
@@ -17,6 +18,7 @@ from app.voice.tts import TTSProvider
 from app.storage.visual_observation import VisualObservationStore
 from app.plugins.manager import PluginManager
 from app.core.resource_manager import ResourceRegistry
+from app.tasks.service import TaskService
 
 
 @dataclass(frozen=True)
@@ -33,6 +35,8 @@ class StorageServices:
     """本地持久化存储服务。"""
 
     memory_store: MemoryStore
+    task_service: TaskService
+    reminder_scheduler: SQLiteOneTimeReminderAdapter
     reminder_store: ReminderStore
     history_store: ChatHistoryStore
     visual_observation_store: VisualObservationStore
@@ -92,6 +96,14 @@ class AppContext:
     @property
     def reminder_store(self) -> ReminderStore:
         return self.storage.reminder_store
+
+    @property
+    def task_service(self) -> TaskService:
+        return self.storage.task_service
+
+    @property
+    def reminder_scheduler(self) -> SQLiteOneTimeReminderAdapter:
+        return self.storage.reminder_scheduler
 
     @property
     def history_store(self) -> ChatHistoryStore:

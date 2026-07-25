@@ -53,6 +53,12 @@ class StoragePaths:
         self.base_dir = Path(base_dir)
         self._data = self.base_dir / "data"
 
+    @property
+    def data_dir(self) -> Path:
+        """Sakura 本地数据根目录，供迁移等跨存储操作使用。"""
+
+        return self._data
+
     # ---- 配置 ----
     @property
     def config_dir(self) -> Path:

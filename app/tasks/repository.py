@@ -385,6 +385,147 @@ class ReminderRepository:
                 ),
             )
 
+    def get_active_one_time_occurrence_for_rule(
+        self, rule_id: str
+    ) -> tuple[ReminderRule, ReminderOccurrence] | None:
+        """返回规则唯一的活动一次性实例，供 Agent 兼容工具回显。"""
+
+        with _read_connection(self._database) as connection:
+            rule_row = connection.execute(
+                """
+                SELECT * FROM reminder_rules
+                WHERE id = ? AND kind = ? AND enabled = 1
+                """,
+                (rule_id, ReminderKind.ONE_TIME.value),
+            ).fetchone()
+            if rule_row is None:
+                return None
+            occurrence_row = connection.execute(
+                """
+                SELECT * FROM reminder_occurrences
+                WHERE rule_id = ? AND status = ?
+                ORDER BY scheduled_at, id
+                LIMIT 1
+                """,
+                (rule_id, ReminderOccurrenceStatus.PENDING.value),
+            ).fetchone()
+        if occurrence_row is None:
+            return None
+        return _rule_from_row(rule_row), _occurrence_from_row(occurrence_row)
+
+    def list_active_one_time_occurrences(
+        self,
+    ) -> list[tuple[ReminderRule, ReminderOccurrence]]:
+        """确定性列出仍活动的一次性提醒；不执行任何到期调度。"""
+
+        with _read_connection(self._database) as connection:
+            rows = connection.execute(
+                """
+                SELECT occurrence.id AS occurrence_id, rule.id AS rule_id
+                FROM reminder_occurrences AS occurrence
+                JOIN reminder_rules AS rule ON rule.id = occurrence.rule_id
+                WHERE rule.kind = ? AND rule.enabled = 1 AND occurrence.status = ?
+                ORDER BY occurrence.scheduled_at, occurrence.id
+                """,
+                (ReminderKind.ONE_TIME.value, ReminderOccurrenceStatus.PENDING.value),
+            ).fetchall()
+            pairs: list[tuple[ReminderRule, ReminderOccurrence]] = []
+            for row in rows:
+                rule_row = connection.execute(
+                    "SELECT * FROM reminder_rules WHERE id = ?", (row["rule_id"],)
+                ).fetchone()
+                occurrence_row = connection.execute(
+                    "SELECT * FROM reminder_occurrences WHERE id = ?", (row["occurrence_id"],)
+                ).fetchone()
+                if rule_row is not None and occurrence_row is not None:
+                    pairs.append((_rule_from_row(rule_row), _occurrence_from_row(occurrence_row)))
+        return pairs
+
+    def cancel_one_time_occurrence(
+        self, occurrence_id: str, now: datetime
+    ) -> tuple[ReminderRule, ReminderOccurrence] | None:
+        """取消一次性实例及其尚未完成的投递，保留完整历史。"""
+
+        now_text = to_utc_text(now)
+        with self._database.transaction(immediate=True) as connection:
+            occurrence_row = connection.execute(
+                """
+                SELECT occurrence.*
+                FROM reminder_occurrences AS occurrence
+                JOIN reminder_rules AS rule ON rule.id = occurrence.rule_id
+                WHERE occurrence.id = ? AND rule.kind = ? AND rule.enabled = 1
+                  AND occurrence.status = ?
+                """,
+                (
+                    occurrence_id,
+                    ReminderKind.ONE_TIME.value,
+                    ReminderOccurrenceStatus.PENDING.value,
+                ),
+            ).fetchone()
+            if occurrence_row is None:
+                return None
+            rule_id = occurrence_row["rule_id"]
+            connection.execute(
+                """
+                UPDATE reminder_occurrences
+                SET status = ?, skip_reason = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    ReminderOccurrenceStatus.CANCELLED.value,
+                    "cancelled_by_user",
+                    now_text,
+                    occurrence_id,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE reminder_rules
+                SET enabled = 0, updated_at = ?
+                WHERE id = ?
+                """,
+                (now_text, rule_id),
+            )
+            connection.execute(
+                """
+                UPDATE notification_deliveries
+                SET status = ?, next_attempt_at = NULL, claim_token = NULL,
+                    claimed_at = NULL, last_error_code = ?
+                WHERE occurrence_id = ? AND status IN (?, ?)
+                """,
+                (
+                    DeliveryStatus.SKIPPED.value,
+                    "reminder_cancelled",
+                    occurrence_id,
+                    DeliveryStatus.PENDING.value,
+                    DeliveryStatus.SENDING.value,
+                ),
+            )
+            rule_row = connection.execute(
+                "SELECT * FROM reminder_rules WHERE id = ?", (rule_id,)
+            ).fetchone()
+            cancelled_occurrence_row = connection.execute(
+                "SELECT * FROM reminder_occurrences WHERE id = ?", (occurrence_id,)
+            ).fetchone()
+        if rule_row is None or cancelled_occurrence_row is None:
+            raise RuntimeError("取消提醒后未找到记录。")
+        return _rule_from_row(rule_row), _occurrence_from_row(cancelled_occurrence_row)
+
+    def count_active_occurrences_for_task(self, task_id: str) -> int:
+        """查询任务仍待发送的实例数，不领取或修改投递记录。"""
+
+        with _read_connection(self._database) as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM reminder_occurrences AS occurrence
+                JOIN reminder_rules AS rule ON rule.id = occurrence.rule_id
+                WHERE occurrence.task_id = ? AND occurrence.status = ? AND rule.enabled = 1
+                """,
+                (task_id, ReminderOccurrenceStatus.PENDING.value),
+            ).fetchone()
+        return int(row["count"]) if row is not None else 0
+
     def claim_due_deliveries(
         self,
         channel: DeliveryChannel,

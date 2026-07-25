@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -10,24 +8,32 @@ from app.agent.desktop_tools import NotesStore, open_local_folder, open_url
 from app.agent.memory import MemoryStore
 from app.agent.reminders import ReminderStore
 from app.agent.screen_tools import create_screen_observation_tool
+from app.agent.task_tools import (
+    SQLiteOneTimeReminderAdapter,
+    create_compatibility_task_tools,
+    create_task_tools,
+)
 from app.agent.tools import Tool, ToolRegistry
 from app.core.runtime_log import log_event
-from app.storage.atomic import atomic_write_text
 from app.storage.paths import StoragePaths
+from app.tasks.service import TaskService
 
 
 def create_builtin_tool_registry(
     base_dir: Path,
     memory: MemoryStore | None = None,
     reminders: ReminderStore | None = None,
+    task_service: TaskService | None = None,
+    reminder_scheduler: SQLiteOneTimeReminderAdapter | None = None,
 ) -> ToolRegistry:
+    # reminders 参数只保留调用兼容性。任务/提醒工具必须显式注入 SQLite 服务，
+    # 绝不在这里为旧 JSON 文件隐式创建另一套数据源。
+    del reminders
     paths = StoragePaths(base_dir)
-    store = TodoStore(paths.tasks_store())
     notes = NotesStore(paths.notes_dir)
     # MemoryStore 是 dataclass，第一个字段是 base_dir；旧写法把 json 路径误传成
     # base_dir（主链路总会注入 memory，未实际触发），这里一并修正
     memory = memory or MemoryStore(base_dir=base_dir)
-    reminders = reminders or ReminderStore(paths.reminders_store())
     registry = ToolRegistry(
         [
             create_screen_observation_tool(),
@@ -37,82 +43,8 @@ def create_builtin_tool_registry(
                 parameters={},
                 handler=lambda _arguments: get_current_time(),
             ),
-            Tool(
-                name="add_todo",
-                description="新增一条待办事项。",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "text": {"type": "string", "description": "待办内容。"},
-                    },
-                    "required": ["text"],
-                },
-                handler=store.add_todo,
-            ),
-            Tool(
-                name="list_todos",
-                description="列出所有未完成待办事项。",
-                parameters={},
-                handler=store.list_todos,
-            ),
-            Tool(
-                name="complete_todo",
-                description="按 id 标记一条待办事项为完成。",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string", "description": "待办 id。"},
-                    },
-                    "required": ["id"],
-                },
-                handler=store.complete_todo,
-            ),
-            Tool(
-                name="add_reminder",
-                description="创建一次性提醒。用户说“几分钟后/几秒后”这类相对时间时，必须优先使用 delay_seconds 或 delay_minutes，让程序计算触发时间；只有用户给出明确日期时间时才使用 trigger_at。repeat 第一版只支持 null 或省略。",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "text": {"type": "string", "description": "提醒内容。"},
-                        "trigger_at": {
-                            "type": "string",
-                            "description": "明确的提醒时间，本地时区 ISO 字符串。相对时间不要使用这个字段。",
-                        },
-                        "delay_seconds": {
-                            "type": "number",
-                            "description": "从现在开始延迟多少秒触发。适合“30 秒后”等相对提醒。",
-                        },
-                        "delay_minutes": {
-                            "type": "number",
-                            "description": "从现在开始延迟多少分钟触发。适合“3 分钟后”等相对提醒。",
-                        },
-                        "repeat": {
-                            "type": ["null"],
-                            "description": "第一版只支持 null。",
-                        },
-                    },
-                    "required": ["text"],
-                },
-                handler=reminders.add_reminder,
-            ),
-            Tool(
-                name="list_reminders",
-                description="列出未完成且未取消的一次性提醒。",
-                parameters={},
-                handler=reminders.list_reminders,
-            ),
-            Tool(
-                name="cancel_reminder",
-                description="按 id 取消一条未完成提醒。",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string", "description": "提醒 id。"},
-                    },
-                    "required": ["id"],
-                },
-                handler=reminders.cancel_reminder,
-            ),
+            *create_task_tools(task_service, reminder_scheduler),
+            *create_compatibility_task_tools(task_service, reminder_scheduler),
             Tool(
                 name="read_note",
                 description="读取 data/notes/ 下的文本笔记。只能读取笔记名，不能读取任意路径。",
@@ -308,70 +240,3 @@ def _memory_update_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
         if key in arguments:
             mapped[key] = arguments.get(key)
     return mapped
-
-
-class TodoStore:
-    """以 JSON 文件保存轻量待办，供内部工具使用。"""
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-
-    def add_todo(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        text = _required_text(arguments, "text")
-        data = self._load()
-        task = {
-            "id": uuid.uuid4().hex[:8],
-            "text": text,
-            "created_at": _now_iso(),
-            "completed_at": None,
-        }
-        data["tasks"].append(task)
-        self._save(data)
-        return {"task": task}
-
-    def list_todos(self, _arguments: dict[str, Any]) -> dict[str, Any]:
-        data = self._load()
-        tasks = [task for task in data["tasks"] if task.get("completed_at") is None]
-        return {"tasks": tasks}
-
-    def complete_todo(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        task_id = _required_text(arguments, "id")
-        data = self._load()
-        for task in data["tasks"]:
-            if task.get("id") == task_id:
-                if task.get("completed_at") is None:
-                    task["completed_at"] = _now_iso()
-                    self._save(data)
-                return {"task": task}
-        raise ValueError(f"未找到待办：{task_id}")
-
-    def _load(self) -> dict[str, list[dict[str, Any]]]:
-        if not self.path.exists():
-            return {"tasks": []}
-
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"待办文件不是有效 JSON：{self.path}") from exc
-        if not isinstance(data, dict) or not isinstance(data.get("tasks"), list):
-            raise ValueError("待办文件格式无效，顶层必须是包含 tasks 列表的对象。")
-        tasks = [task for task in data["tasks"] if isinstance(task, dict)]
-        return {"tasks": tasks}
-
-    def _save(self, data: dict[str, list[dict[str, Any]]]) -> None:
-        atomic_write_text(
-            self.path,
-            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-
-
-def _required_text(arguments: dict[str, Any], key: str) -> str:
-    value = arguments.get(key)
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"缺少必填参数：{key}")
-    return value.strip()
-
-
-def _now_iso() -> str:
-    return datetime.now().astimezone().isoformat(timespec="seconds")

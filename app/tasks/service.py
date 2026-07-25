@@ -112,6 +112,11 @@ class TaskService:
 
         return tuple(self.tasks.list_pending())
 
+    def now(self) -> datetime:
+        """提供使用同一时钟的只读查询边界。"""
+
+        return self._now(None)
+
     def query_today(self, now: datetime) -> TodayQueryResult:
         """委托今日查询服务，避免在生命周期服务中复制查询规则。"""
 
