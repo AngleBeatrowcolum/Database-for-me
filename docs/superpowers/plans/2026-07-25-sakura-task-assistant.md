@@ -124,11 +124,14 @@ tests/test_task_assistant_e2e.py
 Run:
 
 ```bash
-git check-ignore runtime data
-git ls-files --others --exclude-standard | rg '(^|/)(data|runtime|target|__pycache__)/' && exit 1 || true
+git check-ignore runtime data/
+git ls-files --others --exclude-standard | rg '^(data|runtime)/|(^|/)(target|__pycache__)/' && exit 1 || true
 ```
 
-Expected: `runtime` and `data` are reported as ignored; the second command prints nothing.
+Expected: `runtime` and `data/` are reported as ignored; only the root
+`data/` and `runtime/` paths are prohibited, while the
+`app/backchannel/data/` program assets are retained. The second command prints
+nothing.
 
 - [ ] **Step 2: Compile the unmodified Python source**
 
@@ -147,11 +150,14 @@ Run:
 ```bash
 git add .gitignore LICENSE VERSION app install.bat main.py plugins requirements.txt \
   start.bat start_studio.bat third_party tools update-delete.json update.bat
-git diff --cached --check
-git diff --cached --name-only | rg '(^|/)(data|runtime|target)/' && exit 1 || true
+git -c core.whitespace=cr-at-eol,-trailing-space,-blank-at-eof diff --cached --check
+git diff --cached --name-only | rg '^(data|runtime)/|(^|/)(target|__pycache__)/' && exit 1 || true
 ```
 
-Expected: whitespace check passes and no ignored runtime/data/build output is staged.
+Expected: the one-shot permissive whitespace check passes and no prohibited
+root runtime/data or nested target/`__pycache__` output is staged. This
+permissive check is only for importing the existing Windows/vendored baseline
+verbatim; subsequent new code still uses strict `git diff --check`.
 
 - [ ] **Step 4: Commit the clean baseline**
 
