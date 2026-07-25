@@ -36,7 +36,7 @@
 - 简单的按星期周期提醒。
 - 周一至周五 14:00 股票计划检查提醒，允许延迟 30 分钟。
 - 每周日 20:00 周总结。
-- DeepSeek V4 Pro 总结、可选 Codex/Claude 提供者和本地降级总结。
+- DeepSeek V4 Pro 总结和本地降级总结。
 - 用户确认后的私有 GitHub 归档。
 - 满足安全条件后的 14 天数据清理。
 - 现有 `tasks.json` 和 `reminders.json` 的幂等迁移。
@@ -52,6 +52,7 @@
 - 修改博客、Nginx 或线上服务器。
 - 未经确认的 GitHub 上传。
 - 密码、身份证、银行卡等个人敏感资料管理。
+- 使用 Codex CLI 或 Claude Code 生成周总结。
 
 ## 3. 已确认的产品规则
 
@@ -123,7 +124,6 @@ Windows Reminder Worker ─── QQ SMTP
 Windows Weekly Summary Worker
                     │
                     ├── DeepSeek V4 Pro
-                    ├── 可选 Codex/Claude
                     └── 本地规则总结
 
 ReminderScheduler ── AgentEvent ── 文字气泡/TTS
@@ -187,8 +187,6 @@ app/summaries/
 └── providers/
     ├── base.py
     ├── deepseek.py
-    ├── codex_cli.py
-    ├── claude_cli.py
     └── local_fallback.py
 ```
 
@@ -198,7 +196,6 @@ app/summaries/
 - `renderer.py`：把校验后的结构化结果渲染为 Markdown。
 - `providers/base.py`：统一的 `SummaryProvider` 接口。
 - `providers/deepseek.py`：默认 DeepSeek V4 Pro API 提供者。
-- `providers/codex_cli.py`、`claude_cli.py`：仅在用户启用且本机可用时使用的备用提供者。
 - `providers/local_fallback.py`：不联网的固定模板总结。
 
 ### 5.4 平台与工具适配
@@ -692,9 +689,9 @@ generate(snapshot) -> StructuredSummary
 默认顺序：
 
 1. DeepSeek V4 Pro API。
-2. 用户显式启用且当前可用的 Codex CLI。
-3. 用户显式启用且当前可用的 Claude Code。
-4. 本地规则模板。
+2. 本地规则模板。
+
+第一版不安装、不配置也不调用 Codex CLI 或 Claude Code，因此不需要 Claude API Key、Claude Code 订阅或对应的本机登录状态。
 
 DeepSeek API Key 保存在 Windows 凭据管理器：
 
@@ -712,7 +709,7 @@ Sakura/DeepSeekAPI
 - GitHub SSH 私钥。
 - 服务器凭据。
 
-模型必须返回符合 schema 的 JSON。本地校验失败时允许一次格式修复请求；再次失败即切换下一个提供者。最终由 `renderer.py` 生成 Markdown，模型不能直接写文件、操作数据库或运行 Git。
+模型必须返回符合 schema 的 JSON。本地校验失败时允许一次格式修复请求；再次失败即切换到本地规则模板。最终由 `renderer.py` 生成 Markdown，模型不能直接写文件、操作数据库或运行 Git。
 
 ### 13.4 Markdown
 
@@ -913,7 +910,7 @@ data/weekly_summaries/
 
 ### 18.3 周总结
 
-- 模型失败：切换提供者，最终使用本地模板。
+- DeepSeek 调用失败：使用本地模板。
 - Markdown 写入失败：保持原始任务，不进入发布阶段。
 - Git 提交失败：保留草稿。
 - Git 推送或远程校验失败：不归档、不清理。
@@ -971,7 +968,7 @@ data/weekly_summaries/
 - 不主动唤醒休眠电脑。
 - 恢复后截止提醒可以补发。
 - Sakura 关闭时 QQ 邮件仍可发送。
-- Sakura、Codex 和 Claude Code均不需要持续打开。
+- Sakura 不需要持续打开；Codex 和 Claude Code完全不是第一版运行依赖。
 - 周日 20:00 能生成周总结。
 - 未确认时不上传。
 - GitHub 私有状态无法验证时拒绝上传。
