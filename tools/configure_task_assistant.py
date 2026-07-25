@@ -14,6 +14,10 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from app.notifications.credentials import KeyringCredentialStore, QQ_SMTP_CREDENTIAL
 from app.platforms.reminder_task import register_reminder_task, write_reminder_task_xml
+from app.platforms.weekly_summary_task import (
+    register_weekly_summary_task,
+    build_weekly_summary_task_xml,
+)
 from app.storage.paths import StoragePaths
 from app.tasks.backup import DatabaseBackupService
 from app.tasks.database import TaskDatabase
@@ -41,7 +45,8 @@ def _configure(base_dir: Path) -> None:
 
 
 def _register(base_dir: Path) -> None:
-    xml_path = StoragePaths(base_dir).config_dir / "sakura-task-reminder-worker.xml"
+    config_dir = StoragePaths(base_dir).config_dir
+    xml_path = config_dir / "sakura-task-reminder-worker.xml"
     write_reminder_task_xml(
         xml_path,
         python_exe=base_dir / "runtime" / "python.exe",
@@ -49,7 +54,17 @@ def _register(base_dir: Path) -> None:
         base_dir=base_dir,
     )
     register_reminder_task(xml_path)
-    print("已注册 Sakura 邮件提醒计划任务。")
+    weekly_xml = config_dir / "sakura-weekly-summary-worker.xml"
+    weekly_xml.write_text(
+        build_weekly_summary_task_xml(
+            python_exe=base_dir / "runtime" / "python.exe",
+            worker_path=base_dir / "app" / "workers" / "weekly_summary_worker.py",
+            base_dir=base_dir,
+        ),
+        encoding="utf-16",
+    )
+    register_weekly_summary_task(weekly_xml)
+    print("已注册 Sakura 邮件提醒和周总结计划任务。")
 
 
 def main(argv: list[str] | None = None) -> int:
