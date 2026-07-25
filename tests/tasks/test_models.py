@@ -5,9 +5,14 @@ import pytest
 
 from app.storage.paths import StoragePaths
 from app.tasks.models import (
+    DeliveryStatus,
+    DeliveryChannel,
+    NotificationDelivery,
     Priority,
     ReminderOccurrence,
     ReminderOccurrenceStatus,
+    ReminderKind,
+    ReminderRule,
     Task,
     TaskStatus,
     WeeklySummaryRun,
@@ -88,6 +93,7 @@ def test_weekly_summary_status_is_typed_and_rejects_bare_string(fixed_now: datet
         "publishing",
         "published",
         "cleaned",
+        "failed",
     ]
     run = WeeklySummaryRun(
         id="summary-1",
@@ -109,6 +115,25 @@ def test_weekly_summary_status_is_typed_and_rejects_bare_string(fixed_now: datet
     )
 
     assert run.status is WeeklySummaryStatus.AWAITING_APPROVAL
+    failed_run = WeeklySummaryRun(
+        id="summary-3",
+        iso_year=2026,
+        iso_week=30,
+        week_start=fixed_now.date(),
+        week_end=fixed_now.date(),
+        status=WeeklySummaryStatus.FAILED,
+        provider=None,
+        snapshot_sha256=None,
+        draft_path=None,
+        git_commit_sha=None,
+        last_error_code="generation_failed",
+        created_at=fixed_now,
+        generated_at=None,
+        approved_at=None,
+        published_at=None,
+        cleaned_at=None,
+    )
+    assert failed_run.status is WeeklySummaryStatus.FAILED
     with pytest.raises(TypeError):
         WeeklySummaryRun(
             id="summary-2",
@@ -166,6 +191,150 @@ def test_reminder_occurrence_normalizes_datetimes_and_rejects_naive() -> None:
             skip_reason=None,
             created_at=local_time,
             updated_at=local_time,
+        )
+
+    with pytest.raises(TypeError):
+        ReminderOccurrence(
+            id="occurrence-3",
+            rule_id="rule-1",
+            task_id=None,
+            scheduled_at=local_time,
+            expires_at=None,
+            status="pending",
+            skip_reason=None,
+            created_at=local_time,
+            updated_at=local_time,
+        )
+
+
+def test_task_direct_constructor_enforces_status_and_priority_enums(fixed_now: datetime) -> None:
+    task = Task(
+        id="task-1",
+        title="任务",
+        details="",
+        status=TaskStatus.PENDING,
+        priority=Priority.NORMAL,
+        planned_date=None,
+        due_at=None,
+        created_at=fixed_now,
+        updated_at=fixed_now,
+        completed_at=None,
+        cancelled_at=None,
+    )
+
+    assert task.status is TaskStatus.PENDING
+    assert task.priority is Priority.NORMAL
+    with pytest.raises(TypeError):
+        Task(
+            id="task-2",
+            title="任务",
+            details="",
+            status="pending",
+            priority=Priority.NORMAL,
+            planned_date=None,
+            due_at=None,
+            created_at=fixed_now,
+            updated_at=fixed_now,
+            completed_at=None,
+            cancelled_at=None,
+        )
+    with pytest.raises(TypeError):
+        Task(
+            id="task-3",
+            title="任务",
+            details="",
+            status=TaskStatus.PENDING,
+            priority="normal",
+            planned_date=None,
+            due_at=None,
+            created_at=fixed_now,
+            updated_at=fixed_now,
+            completed_at=None,
+            cancelled_at=None,
+        )
+
+
+def test_reminder_rule_direct_constructor_enforces_kind_enum(fixed_now: datetime) -> None:
+    rule = ReminderRule(
+        id="rule-1",
+        task_id=None,
+        message="提醒",
+        kind=ReminderKind.ONE_TIME,
+        offset_seconds=None,
+        weekdays_mask=None,
+        time_of_day=None,
+        timezone="Asia/Shanghai",
+        grace_seconds=None,
+        desktop_enabled=True,
+        email_enabled=False,
+        enabled=True,
+        created_at=fixed_now,
+        updated_at=fixed_now,
+    )
+
+    assert rule.kind is ReminderKind.ONE_TIME
+    with pytest.raises(TypeError):
+        ReminderRule(
+            id="rule-2",
+            task_id=None,
+            message="提醒",
+            kind="one_time",
+            offset_seconds=None,
+            weekdays_mask=None,
+            time_of_day=None,
+            timezone="Asia/Shanghai",
+            grace_seconds=None,
+            desktop_enabled=True,
+            email_enabled=False,
+            enabled=True,
+            created_at=fixed_now,
+            updated_at=fixed_now,
+        )
+
+
+def test_notification_delivery_direct_constructor_enforces_channel_and_status_enums(
+    fixed_now: datetime,
+) -> None:
+    delivery = NotificationDelivery(
+        id="delivery-1",
+        occurrence_id="occurrence-1",
+        channel=DeliveryChannel.DESKTOP,
+        status=DeliveryStatus.PENDING,
+        attempt_count=0,
+        next_attempt_at=fixed_now,
+        claimed_at=None,
+        claim_token=None,
+        sent_at=None,
+        last_error_code=None,
+    )
+
+    assert delivery.channel is DeliveryChannel.DESKTOP
+    assert delivery.status is DeliveryStatus.PENDING
+    with pytest.raises(TypeError):
+        NotificationDelivery(
+            id="delivery-2",
+            occurrence_id="occurrence-1",
+            channel="desktop",
+            status=DeliveryStatus.PENDING,
+            attempt_count=0,
+            next_attempt_at=fixed_now,
+            claimed_at=None,
+            claim_token=None,
+            sent_at=None,
+            last_error_code=None,
+        )
+    with pytest.raises(TypeError):
+        NotificationDelivery(
+            id="delivery-3",
+            occurrence_id="occurrence-1",
+            channel=DeliveryChannel.DESKTOP,
+            status="pending",
+            attempt_count=0,
+            next_attempt_at=fixed_now,
+            claimed_at=None,
+            claim_token=None,
+            sent_at=None,
+            last_error_code=None,
         )
 
 

@@ -39,12 +39,16 @@ class ReminderOccurrenceStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
-class NotificationDeliveryStatus(str, Enum):
+class DeliveryStatus(str, Enum):
     PENDING = "pending"
     SENDING = "sending"
     SENT = "sent"
     FAILED = "failed"
     SKIPPED = "skipped"
+
+
+# 保留首版公开名称，避免后续消费者因规范名称调整而失效。
+NotificationDeliveryStatus = DeliveryStatus
 
 
 class WeeklySummaryStatus(str, Enum):
@@ -54,6 +58,7 @@ class WeeklySummaryStatus(str, Enum):
     PUBLISHING = "publishing"
     PUBLISHED = "published"
     CLEANED = "cleaned"
+    FAILED = "failed"
 
 
 def ensure_utc(value: datetime) -> datetime:
@@ -107,6 +112,10 @@ class Task:
     cancelled_at: datetime | None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.status, TaskStatus):
+            raise TypeError("任务状态必须是 TaskStatus。")
+        if not isinstance(self.priority, Priority):
+            raise TypeError("任务优先级必须是 Priority。")
         for field_name in (
             "due_at",
             "created_at",
@@ -172,6 +181,8 @@ class ReminderRule:
     updated_at: datetime
 
     def __post_init__(self) -> None:
+        if not isinstance(self.kind, ReminderKind):
+            raise TypeError("提醒规则类型必须是 ReminderKind。")
         object.__setattr__(self, "created_at", ensure_utc(self.created_at))
         object.__setattr__(self, "updated_at", ensure_utc(self.updated_at))
 
@@ -189,6 +200,8 @@ class ReminderOccurrence:
     updated_at: datetime
 
     def __post_init__(self) -> None:
+        if not isinstance(self.status, ReminderOccurrenceStatus):
+            raise TypeError("提醒实例状态必须是 ReminderOccurrenceStatus。")
         for field_name in ("scheduled_at", "expires_at", "created_at", "updated_at"):
             value = getattr(self, field_name)
             if value is not None:
@@ -200,7 +213,7 @@ class NotificationDelivery:
     id: str
     occurrence_id: str
     channel: DeliveryChannel
-    status: NotificationDeliveryStatus
+    status: DeliveryStatus
     attempt_count: int
     next_attempt_at: datetime | None
     claimed_at: datetime | None
@@ -209,6 +222,10 @@ class NotificationDelivery:
     last_error_code: str | None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.channel, DeliveryChannel):
+            raise TypeError("通知渠道必须是 DeliveryChannel。")
+        if not isinstance(self.status, DeliveryStatus):
+            raise TypeError("通知投递状态必须是 DeliveryStatus。")
         for field_name in ("next_attempt_at", "claimed_at", "sent_at"):
             value = getattr(self, field_name)
             if value is not None:
