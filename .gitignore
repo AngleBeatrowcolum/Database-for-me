@@ -60,3 +60,6 @@ Desktop.ini
 
 # 头脑风暴可视化临时内容
 /.superpowers/
+
+# 子代理隔离开发工作区
+/.worktrees/
