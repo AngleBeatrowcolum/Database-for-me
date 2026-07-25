@@ -376,12 +376,21 @@ class ReminderRepository:
                 UPDATE reminder_rules
                 SET message = ?, updated_at = ?
                 WHERE task_id = ? AND kind = ? AND enabled = 1
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM reminder_occurrences AS occurrence
+                      JOIN notification_deliveries AS delivery
+                        ON delivery.occurrence_id = occurrence.id
+                      WHERE occurrence.rule_id = reminder_rules.id
+                        AND delivery.status = ?
+                  )
                 """,
                 (
                     message,
                     to_utc_text(now),
                     task_id,
                     ReminderKind.DEADLINE_OFFSET.value,
+                    DeliveryStatus.SENT.value,
                 ),
             )
 

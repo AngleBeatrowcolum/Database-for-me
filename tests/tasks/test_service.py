@@ -352,6 +352,53 @@ def test_title_update_refreshes_only_enabled_deadline_rule_messages(
     assert sent["status"] == DeliveryStatus.SENT.value
 
 
+def test_title_update_does_not_rewrite_an_enabled_deadline_rule_with_sent_delivery(
+    service, task_database, fixed_now
+) -> None:
+    task = service.create_task("旧标题", due_at=fixed_now + timedelta(days=2), now=fixed_now)
+    delivery = service.reminders.claim_due_deliveries(
+        DeliveryChannel.EMAIL, fixed_now + timedelta(days=1), 1
+    )[0]
+    assert service.reminders.mark_delivery_sent(
+        delivery.id, delivery.claim_token, fixed_now + timedelta(days=1)
+    ) is True
+    with task_database.connect() as connection:
+        sent_rule_before = connection.execute(
+            """
+            SELECT rule.id, rule.message, rule.updated_at
+            FROM reminder_rules AS rule
+            JOIN reminder_occurrences AS occurrence ON occurrence.rule_id = rule.id
+            JOIN notification_deliveries AS sent ON sent.occurrence_id = occurrence.id
+            WHERE sent.id = ?
+            """,
+            (delivery.id,),
+        ).fetchone()
+
+    service.update_task(
+        task.id,
+        title="新标题",
+        now=fixed_now + timedelta(days=1, minutes=1),
+    )
+
+    with task_database.connect() as connection:
+        sent_rule_after = connection.execute(
+            "SELECT message, updated_at FROM reminder_rules WHERE id = ?",
+            (sent_rule_before["id"],),
+        ).fetchone()
+        unsent_rule = connection.execute(
+            """
+            SELECT message FROM reminder_rules
+            WHERE task_id = ? AND id != ?
+            """,
+            (task.id, sent_rule_before["id"]),
+        ).fetchone()
+    assert dict(sent_rule_after) == {
+        "message": sent_rule_before["message"],
+        "updated_at": sent_rule_before["updated_at"],
+    }
+    assert unsent_rule["message"] == "新标题"
+
+
 def test_rejects_invalid_state_transitions_with_domain_error(service, fixed_now) -> None:
     task = service.create_task("状态", now=fixed_now)
     service.complete_task(task.id, now=fixed_now + timedelta(seconds=1))
