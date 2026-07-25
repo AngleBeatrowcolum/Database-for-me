@@ -26,6 +26,9 @@ _LOCK_STALE_AFTER = timedelta(minutes=10)
 _LOCK_UNLINK_ATTEMPTS = 5
 _LOCK_UNLINK_INITIAL_DELAY_SECONDS = 0.05
 _RETRYABLE_WINERRORS = {5, 32}
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_STILL_ACTIVE = 259
+_ERROR_INVALID_PARAMETER = 87
 
 
 @dataclass(frozen=True)
@@ -363,9 +366,6 @@ class DatabaseBackupService:
 
     @staticmethod
     def _is_process_alive(pid: int) -> bool:
-        if os.name == "nt":
-            # Windows 的 os.kill(pid, 0) 会实际终止进程，绝不可调用。
-            return True
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
@@ -383,8 +383,8 @@ class DatabaseBackupService:
         pid, created_at = metadata
         if datetime.now(timezone.utc) - created_at < _LOCK_STALE_AFTER:
             return False
-        if os.name == "nt":
-            return True
+        if _is_windows():
+            return not _windows_process_alive(pid)
         return not self._is_process_alive(pid)
 
     @staticmethod
@@ -449,6 +449,69 @@ class DatabaseBackupService:
 
 def _quarantine_paths(moved: tuple[tuple[Path, Path], ...]) -> tuple[Path, ...]:
     return tuple(destination for _, destination in moved)
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _windows_process_alive(pid: int) -> bool:
+    """仅在可明确确定 Windows 进程已退出时返回 ``False``。"""
+
+    try:
+        handle, error_code = _windows_open_process(pid)
+    except Exception:
+        return True
+    if not handle:
+        return error_code != _ERROR_INVALID_PARAMETER
+    try:
+        return _windows_get_exit_code(handle) == _STILL_ACTIVE
+    except Exception:
+        return True
+    finally:
+        try:
+            _windows_close_handle(handle)
+        except Exception:
+            pass
+
+
+def _windows_open_process(pid: int) -> tuple[object | None, int | None]:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.DWORD,
+    )
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    return handle, ctypes.get_last_error() if not handle else None
+
+
+def _windows_get_exit_code(handle: object) -> int:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    exit_code = wintypes.DWORD()
+    if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+        raise OSError(ctypes.get_last_error(), "GetExitCodeProcess failed")
+    return exit_code.value
+
+
+def _windows_close_handle(handle: object) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    if not kernel32.CloseHandle(handle):
+        raise OSError(ctypes.get_last_error(), "CloseHandle failed")
 
 
 def _normalise_reason(value: str) -> str:

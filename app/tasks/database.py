@@ -198,6 +198,10 @@ class TaskDatabase:
     def initialize(self) -> None:
         """创建并升级数据库 schema，拒绝继续使用损坏数据库。"""
 
+        with self.operation_barrier():
+            self._initialize()
+
+    def _initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         lock_descriptor: int | None = None
         connection: sqlite3.Connection | None = None

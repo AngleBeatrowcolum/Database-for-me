@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 import app.tasks.backup as backup_module
+import app.tasks.database as database_module
 from app.tasks.backup import DatabaseBackupService, RestoreRollbackError
 from app.tasks.errors import ConfirmationRequired
 
@@ -117,7 +118,7 @@ def test_daily_backup_recovers_only_verified_stale_dead_process_lock(
     assert not lock_path.exists()
 
 
-def test_windows_reclaims_expired_daily_lock_without_calling_os_kill(
+def test_windows_keeps_expired_daily_lock_owned_by_a_live_process(
     task_database, tmp_path: Path, fixed_now: datetime, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     service = DatabaseBackupService(task_database, tmp_path / "backups")
@@ -127,7 +128,38 @@ def test_windows_reclaims_expired_daily_lock_without_calling_os_kill(
         json.dumps({"pid": 1234, "created_at": "2000-01-01T00:00:00Z"}),
         encoding="utf-8",
     )
-    monkeypatch.setattr(backup_module.os, "name", "nt")
+    monkeypatch.setattr(backup_module, "_is_windows", lambda: True, raising=False)
+    monkeypatch.setattr(
+        backup_module, "_windows_process_alive", lambda pid: True, raising=False
+    )
+    monkeypatch.setattr(
+        backup_module.os,
+        "kill",
+        lambda pid, signal: (_ for _ in ()).throw(AssertionError("must not kill on Windows")),
+    )
+    ticks = iter((0.0, 0.0, 6.0))
+    monkeypatch.setattr(backup_module.time, "monotonic", lambda: next(ticks))
+
+    with pytest.raises(TimeoutError):
+        service.create_backup(reason="daily", now=fixed_now)
+
+    assert lock_path.exists()
+
+
+def test_windows_reclaims_expired_daily_lock_owned_by_a_dead_process(
+    task_database, tmp_path: Path, fixed_now: datetime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = DatabaseBackupService(task_database, tmp_path / "backups")
+    service.backup_dir.mkdir()
+    lock_path = service.backup_dir / ".daily.lock"
+    lock_path.write_text(
+        json.dumps({"pid": 1234, "created_at": "2000-01-01T00:00:00Z"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(backup_module, "_is_windows", lambda: True, raising=False)
+    monkeypatch.setattr(
+        backup_module, "_windows_process_alive", lambda pid: False, raising=False
+    )
     monkeypatch.setattr(
         backup_module.os,
         "kill",
@@ -138,6 +170,36 @@ def test_windows_reclaims_expired_daily_lock_without_calling_os_kill(
 
     assert backup.exists()
     assert not lock_path.exists()
+
+
+def test_windows_process_liveness_closes_queried_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    closed_handles: list[object] = []
+    handle = object()
+    monkeypatch.setattr(
+        backup_module,
+        "_windows_open_process",
+        lambda pid: (handle, None),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        backup_module, "_windows_get_exit_code", lambda value: 259, raising=False
+    )
+    monkeypatch.setattr(
+        backup_module,
+        "_windows_close_handle",
+        lambda value: closed_handles.append(value),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        backup_module.os,
+        "kill",
+        lambda pid, signal: (_ for _ in ()).throw(AssertionError("must not kill on Windows")),
+    )
+
+    assert backup_module._windows_process_alive(1234) is True
+    assert closed_handles == [handle]
 
 
 def test_daily_backup_recovers_verified_stale_legacy_pid_lock(
@@ -369,6 +431,79 @@ def test_restore_operation_barrier_blocks_connect_and_backup_during_replace_gap(
     assert not connect_thread.is_alive()
     assert not backup_thread.is_alive()
     assert errors == []
+
+
+def test_restore_operation_barrier_blocks_initialize_before_it_creates_database(
+    task_database, tmp_path: Path, fixed_now: datetime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = DatabaseBackupService(task_database, tmp_path / "backups")
+    _insert_marker(task_database, "restore-gap", "original")
+    backup = service.create_backup(reason="migration", now=fixed_now)
+    _insert_marker(task_database, "restore-gap", "current")
+    entered_replace = threading.Event()
+    allow_replace = threading.Event()
+    initialization_finished = threading.Event()
+    database_created = threading.Event()
+    restore_errors: list[BaseException] = []
+    initialization_errors: list[BaseException] = []
+    original_open = database_module.os.open
+
+    def observe_database_creation(path, flags, mode=0o777):
+        descriptor = original_open(path, flags, mode)
+        if (
+            Path(path) == task_database.path
+            and flags & os.O_CREAT
+            and flags & os.O_EXCL
+        ):
+            database_created.set()
+        return descriptor
+
+    def pause_then_fail_replace(source: Path, target: Path) -> None:
+        entered_replace.set()
+        assert allow_replace.wait(timeout=2)
+        raise OSError("forced replace failure")
+
+    monkeypatch.setattr(database_module.os, "open", observe_database_creation)
+    monkeypatch.setattr(backup_module, "replace_with_retry", pause_then_fail_replace)
+
+    def restore() -> None:
+        try:
+            service.restore(backup, confirmed=True)
+        except BaseException as exc:
+            restore_errors.append(exc)
+
+    def initialize() -> None:
+        try:
+            task_database.initialize()
+        except BaseException as exc:
+            initialization_errors.append(exc)
+        finally:
+            initialization_finished.set()
+
+    restore_thread = threading.Thread(target=restore)
+    restore_thread.start()
+    assert entered_replace.wait(timeout=2)
+    assert not task_database.path.exists()
+    initialize_thread = threading.Thread(target=initialize)
+    initialize_thread.start()
+    try:
+        assert not database_created.wait(timeout=0.15)
+        assert not initialization_finished.is_set()
+    finally:
+        allow_replace.set()
+        restore_thread.join(timeout=2)
+        initialize_thread.join(timeout=2)
+
+    assert not restore_thread.is_alive()
+    assert not initialize_thread.is_alive()
+    assert len(restore_errors) == 1
+    assert isinstance(restore_errors[0], OSError)
+    assert "forced replace failure" in str(restore_errors[0])
+    assert initialization_errors == []
+    with task_database.connect() as connection:
+        assert connection.execute(
+            "SELECT value FROM maintenance_state WHERE key = 'restore-gap'"
+        ).fetchone()[0] == "current"
 
 
 def test_restore_requires_confirmation_rejects_bad_input_and_quarantines_current_database(
