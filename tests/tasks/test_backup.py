@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 import app.tasks.backup as backup_module
-from app.tasks.backup import DatabaseBackupService
+from app.tasks.backup import DatabaseBackupService, RestoreRollbackError
 from app.tasks.errors import ConfirmationRequired
 
 
@@ -108,8 +108,31 @@ def test_daily_backup_recovers_only_verified_stale_dead_process_lock(
         json.dumps({"pid": 999_999_999, "created_at": "2000-01-01T00:00:00Z"}),
         encoding="utf-8",
     )
-    ticks = iter((0.0, 6.0))
+    ticks = iter((0.0, 0.0, 6.0))
     monkeypatch.setattr(backup_module.time, "monotonic", lambda: next(ticks))
+
+    backup = service.create_backup(reason="daily", now=fixed_now)
+
+    assert backup.exists()
+    assert not lock_path.exists()
+
+
+def test_windows_reclaims_expired_daily_lock_without_calling_os_kill(
+    task_database, tmp_path: Path, fixed_now: datetime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = DatabaseBackupService(task_database, tmp_path / "backups")
+    service.backup_dir.mkdir()
+    lock_path = service.backup_dir / ".daily.lock"
+    lock_path.write_text(
+        json.dumps({"pid": 1234, "created_at": "2000-01-01T00:00:00Z"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(backup_module.os, "name", "nt")
+    monkeypatch.setattr(
+        backup_module.os,
+        "kill",
+        lambda pid, signal: (_ for _ in ()).throw(AssertionError("must not kill on Windows")),
+    )
 
     backup = service.create_backup(reason="daily", now=fixed_now)
 
@@ -163,7 +186,7 @@ def test_daily_backup_keeps_fresh_invalid_lock_and_times_out(
     service.backup_dir.mkdir()
     lock_path = service.backup_dir / ".daily.lock"
     lock_path.write_text("not valid lock metadata", encoding="utf-8")
-    ticks = iter((0.0, 6.0))
+    ticks = iter((0.0, 0.0, 6.0))
     monkeypatch.setattr(backup_module.time, "monotonic", lambda: next(ticks))
 
     with pytest.raises(TimeoutError):
@@ -252,6 +275,102 @@ def test_restore_failure_rolls_quarantined_database_files_back_to_original_names
     assert not list(task_database.path.parent.glob("tasks.db.quarantine-*"))
 
 
+def test_restore_reports_isolation_paths_when_rollback_cannot_restore_original_database(
+    task_database, tmp_path: Path, fixed_now: datetime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = DatabaseBackupService(task_database, tmp_path / "backups")
+    backup = service.create_backup(reason="migration", now=fixed_now)
+    task_database.path.with_name(f"{task_database.path.name}-wal").write_bytes(b"wal")
+    task_database.path.with_name(f"{task_database.path.name}-shm").write_bytes(b"shm")
+    original_rename = backup_module.rename_with_retry
+
+    def fail_rollback(source: Path, destination: Path) -> None:
+        if ".quarantine-" in source.name:
+            raise OSError("forced rollback failure")
+        original_rename(source, destination)
+
+    monkeypatch.setattr(backup_module, "rename_with_retry", fail_rollback)
+    monkeypatch.setattr(
+        backup_module,
+        "replace_with_retry",
+        lambda source, target: (_ for _ in ()).throw(OSError("forced replace failure")),
+    )
+
+    with pytest.raises(RestoreRollbackError) as error:
+        service.restore(backup, confirmed=True)
+
+    assert isinstance(error.value.__cause__, OSError)
+    assert "forced replace failure" in str(error.value.__cause__)
+    assert error.value.quarantine_paths
+    assert set(error.value.failed_paths) == set(error.value.quarantine_paths)
+    assert len(error.value.quarantine_paths) == 3
+    assert all(path.exists() for path in error.value.quarantine_paths)
+    assert not task_database.path.exists()
+
+
+def test_restore_operation_barrier_blocks_connect_and_backup_during_replace_gap(
+    task_database, tmp_path: Path, fixed_now: datetime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = DatabaseBackupService(task_database, tmp_path / "backups")
+    backup = service.create_backup(reason="migration", now=fixed_now)
+    entered_replace = threading.Event()
+    allow_replace = threading.Event()
+    connect_finished = threading.Event()
+    backup_finished = threading.Event()
+    errors: list[BaseException] = []
+    original_replace = backup_module.replace_with_retry
+
+    def pause_replace(source: Path, target: Path) -> None:
+        entered_replace.set()
+        assert allow_replace.wait(timeout=2)
+        original_replace(source, target)
+
+    monkeypatch.setattr(backup_module, "replace_with_retry", pause_replace)
+
+    def restore() -> None:
+        try:
+            service.restore(backup, confirmed=True)
+        except BaseException as exc:
+            errors.append(exc)
+
+    def connect() -> None:
+        try:
+            connection = task_database.connect()
+            connection.close()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            connect_finished.set()
+
+    def create_backup() -> None:
+        try:
+            service.create_backup(reason="cleanup", now=fixed_now + timedelta(seconds=1))
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            backup_finished.set()
+
+    restore_thread = threading.Thread(target=restore)
+    restore_thread.start()
+    assert entered_replace.wait(timeout=2)
+    connect_thread = threading.Thread(target=connect)
+    backup_thread = threading.Thread(target=create_backup)
+    connect_thread.start()
+    backup_thread.start()
+
+    assert not connect_finished.wait(timeout=0.15)
+    assert not backup_finished.wait(timeout=0.15)
+    allow_replace.set()
+    restore_thread.join(timeout=2)
+    connect_thread.join(timeout=2)
+    backup_thread.join(timeout=2)
+
+    assert not restore_thread.is_alive()
+    assert not connect_thread.is_alive()
+    assert not backup_thread.is_alive()
+    assert errors == []
+
+
 def test_restore_requires_confirmation_rejects_bad_input_and_quarantines_current_database(
     task_database, tmp_path: Path, fixed_now: datetime
 ) -> None:
@@ -276,7 +395,13 @@ def test_restore_requires_confirmation_rejects_bad_input_and_quarantines_current
     task_database.path.with_name(f"{task_database.path.name}-shm").write_bytes(b"shm")
     assert service.restore(backup, confirmed=True) == task_database.path
     assert task_database.integrity_check()
-    quarantine = next(task_database.path.parent.glob("tasks.db.quarantine-*"))
+    quarantines = [
+        path
+        for path in task_database.path.parent.glob("tasks.db.quarantine-*")
+        if not path.name.endswith(("-wal", "-shm"))
+    ]
+    assert len(quarantines) == 1
+    quarantine = quarantines[0]
     assert quarantine.with_name(f"{quarantine.name}-wal").exists()
     assert quarantine.with_name(f"{quarantine.name}-shm").exists()
     with task_database.connect() as connection:

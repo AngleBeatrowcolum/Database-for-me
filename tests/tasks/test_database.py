@@ -73,6 +73,17 @@ def test_initialize_supports_relative_database_paths(
     assert [row["version"] for row in versions] == [1]
 
 
+def test_connect_rejects_missing_database_without_creating_an_empty_file(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "missing.db"
+
+    with pytest.raises(sqlite3.OperationalError):
+        TaskDatabase(database_path).connect()
+
+    assert not database_path.exists()
+
+
 def test_failed_initializer_does_not_delete_other_initializer_database(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

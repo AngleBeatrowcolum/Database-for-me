@@ -35,6 +35,22 @@ class BackupResult:
     reason: str
 
 
+class RestoreRollbackError(RuntimeError):
+    """恢复失败且原数据库无法完整回滚时提供隔离文件位置。"""
+
+    def __init__(
+        self,
+        original_error: BaseException,
+        quarantine_paths: tuple[Path, ...],
+        failed_paths: tuple[Path, ...],
+    ):
+        self.original_error = original_error
+        self.quarantine_paths = quarantine_paths
+        self.failed_paths = failed_paths
+        locations = ", ".join(str(path) for path in quarantine_paths)
+        super().__init__(f"数据库恢复失败，原文件保留在隔离路径：{locations}")
+
+
 class DatabaseBackupService:
     """使用 SQLite 原生 backup API 创建、轮换和恢复本地快照。"""
 
@@ -62,15 +78,16 @@ class DatabaseBackupService:
     ) -> Path:
         """创建已验证的在线快照；失败时不轮换现有有效备份。"""
 
-        timestamp = ensure_utc(now or self._clock())
-        normalized_reason = _normalise_reason(reason)
-        self.backup_dir.mkdir(parents=True, exist_ok=True)
-        if normalized_reason == "daily":
-            result = self._create_daily(timestamp)
-        else:
-            result = self._create_snapshot(timestamp, normalized_reason)
-        if result.created:
-            self._prune_valid_backups()
+        with self.database.operation_barrier():
+            timestamp = ensure_utc(now or self._clock())
+            normalized_reason = _normalise_reason(reason)
+            self.backup_dir.mkdir(parents=True, exist_ok=True)
+            if normalized_reason == "daily":
+                result = self._create_daily(timestamp)
+            else:
+                result = self._create_snapshot(timestamp, normalized_reason)
+            if result.created:
+                self._prune_valid_backups()
         if result.path is None:
             raise RuntimeError("备份创建未返回文件路径。")
         return result.path
@@ -103,31 +120,38 @@ class DatabaseBackupService:
 
         if not confirmed:
             raise ConfirmationRequired("恢复数据库需要显式确认。")
-        source = Path(path)
-        if not self.is_valid(source):
-            raise ValueError("所选备份不是有效的 SQLite 数据库。")
+        with self.database.operation_barrier():
+            source = Path(path)
+            if not self.is_valid(source):
+                raise ValueError("所选备份不是有效的 SQLite 数据库。")
 
-        target = self.database.path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self._snapshot_file_to_temp(source, target.parent, target.name)
-        moved: tuple[tuple[Path, Path], ...] = ()
-        try:
-            if not self._integrity_ok(temporary):
-                raise RuntimeError("恢复临时数据库完整性检查失败。")
-            moved = self._quarantine_current_database(target)
-            replace_with_retry(temporary, target)
-            temporary = None
-        except BaseException:
-            if moved:
-                self._restore_quarantined_database(moved)
-            raise
-        finally:
-            if temporary is not None:
-                try:
-                    Path(temporary).unlink()
-                except OSError:
-                    pass
-        return target
+            target = self.database.path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self._snapshot_file_to_temp(source, target.parent, target.name)
+            moved: tuple[tuple[Path, Path], ...] = ()
+            try:
+                if not self._integrity_ok(temporary):
+                    raise RuntimeError("恢复临时数据库完整性检查失败。")
+                moved = self._quarantine_current_database(target)
+                replace_with_retry(temporary, target)
+                temporary = None
+            except BaseException as original_error:
+                if moved:
+                    failed_paths = self._restore_quarantined_database(moved)
+                    if failed_paths:
+                        raise RestoreRollbackError(
+                            original_error,
+                            _quarantine_paths(moved),
+                            failed_paths,
+                        ) from original_error
+                raise
+            finally:
+                if temporary is not None:
+                    try:
+                        Path(temporary).unlink()
+                    except OSError:
+                        pass
+            return target
 
     def _create_daily(self, timestamp: datetime) -> BackupResult:
         day = _shanghai_date(timestamp)
@@ -312,24 +336,36 @@ class DatabaseBackupService:
                     continue
                 rename_with_retry(source, destination)
                 moved.append((source, destination))
-        except BaseException:
-            self._restore_quarantined_database(tuple(moved))
+        except BaseException as original_error:
+            failed_paths = self._restore_quarantined_database(tuple(moved))
+            if failed_paths:
+                moved_paths = tuple(destination for _, destination in moved)
+                raise RestoreRollbackError(
+                    original_error, moved_paths, failed_paths
+                ) from original_error
             raise
         return tuple(moved)
 
     @staticmethod
-    def _restore_quarantined_database(moved: tuple[tuple[Path, Path], ...]) -> None:
+    def _restore_quarantined_database(
+        moved: tuple[tuple[Path, Path], ...]
+    ) -> tuple[Path, ...]:
+        failed_paths: list[Path] = []
         for source, destination in reversed(moved):
             if source.exists() or not destination.exists():
+                failed_paths.append(destination)
                 continue
             try:
                 rename_with_retry(destination, source)
             except OSError:
-                # 如果 Windows 句柄仍阻止回滚，原文件仍安全保留在隔离路径。
-                continue
+                failed_paths.append(destination)
+        return tuple(failed_paths)
 
     @staticmethod
     def _is_process_alive(pid: int) -> bool:
+        if os.name == "nt":
+            # Windows 的 os.kill(pid, 0) 会实际终止进程，绝不可调用。
+            return True
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
@@ -347,6 +383,8 @@ class DatabaseBackupService:
         pid, created_at = metadata
         if datetime.now(timezone.utc) - created_at < _LOCK_STALE_AFTER:
             return False
+        if os.name == "nt":
+            return True
         return not self._is_process_alive(pid)
 
     @staticmethod
@@ -407,6 +445,10 @@ class DatabaseBackupService:
         descriptor, name = tempfile.mkstemp(dir=directory, prefix=prefix, suffix=".tmp")
         os.close(descriptor)
         return Path(name)
+
+
+def _quarantine_paths(moved: tuple[tuple[Path, Path], ...]) -> tuple[Path, ...]:
+    return tuple(destination for _, destination in moved)
 
 
 def _normalise_reason(value: str) -> str:

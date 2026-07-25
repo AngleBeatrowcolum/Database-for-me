@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -15,6 +16,7 @@ from app.tasks.errors import DatabaseCorruptError
 
 _SQLITE_TIMEOUT_SECONDS = 5.0
 _INITIALIZATION_LOCK_SUFFIX = ".init.lock"
+_OPERATION_LOCK_SUFFIX = ".operation.lock"
 _LOCK_POLL_INTERVAL_SECONDS = 0.05
 
 
@@ -175,11 +177,19 @@ class TaskDatabase:
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
+        self._operation_state_lock = threading.RLock()
+        self._operation_owner_thread: int | None = None
+        self._operation_depth = 0
 
     def connect(self) -> sqlite3.Connection:
         """创建已启用外键检查的数据库连接。"""
 
-        connection = sqlite3.connect(self.path, timeout=_SQLITE_TIMEOUT_SECONDS)
+        self._wait_for_operation_barrier()
+        connection = sqlite3.connect(
+            self._database_uri(self.path, mode="rw"),
+            timeout=_SQLITE_TIMEOUT_SECONDS,
+            uri=True,
+        )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=5000")
@@ -268,9 +278,43 @@ class TaskDatabase:
         finally:
             connection.close()
 
+    @contextmanager
+    def operation_barrier(self) -> Iterator[None]:
+        """串行化备份/恢复，并让并发 ``connect`` 等待其关键区结束。"""
+
+        current_thread = threading.get_ident()
+        with self._operation_state_lock:
+            if self._operation_owner_thread == current_thread:
+                self._operation_depth += 1
+                nested = True
+            else:
+                nested = False
+        if nested:
+            try:
+                yield
+            finally:
+                with self._operation_state_lock:
+                    self._operation_depth -= 1
+            return
+
+        handle = self._acquire_operation_lock()
+        with self._operation_state_lock:
+            self._operation_owner_thread = current_thread
+            self._operation_depth = 1
+        try:
+            yield
+        finally:
+            with self._operation_state_lock:
+                self._operation_depth = 0
+                self._operation_owner_thread = None
+            try:
+                self._unlock_operation_file(handle)
+            finally:
+                handle.close()
+
     def integrity_check(self, path: Path | None = None) -> bool:
         target = path or self.path
-        connection = sqlite3.connect(target)
+        connection = sqlite3.connect(self._database_uri(target, mode="ro"), uri=True)
         try:
             return connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         finally:
@@ -292,7 +336,7 @@ class TaskDatabase:
         connection: sqlite3.Connection | None = None
         try:
             connection = sqlite3.connect(
-                f"{self.path.resolve().as_uri()}?mode=ro",
+                self._database_uri(self.path, mode="ro"),
                 timeout=_SQLITE_TIMEOUT_SECONDS,
                 uri=True,
             )
@@ -326,6 +370,81 @@ class TaskDatabase:
 
     def _initialization_lock_path(self) -> Path:
         return self.path.with_name(f"{self.path.name}{_INITIALIZATION_LOCK_SUFFIX}")
+
+    def _operation_lock_path(self) -> Path:
+        return self.path.with_name(f"{self.path.name}{_OPERATION_LOCK_SUFFIX}")
+
+    def _wait_for_operation_barrier(self) -> None:
+        with self._operation_state_lock:
+            if self._operation_owner_thread == threading.get_ident():
+                return
+        deadline = time.monotonic() + _SQLITE_TIMEOUT_SECONDS
+        while True:
+            handle = self._open_operation_lock_file()
+            try:
+                if self._try_lock_operation_file(handle):
+                    self._unlock_operation_file(handle)
+                    return
+            finally:
+                handle.close()
+            if time.monotonic() >= deadline:
+                raise sqlite3.OperationalError("任务数据库备份或恢复正在进行中。")
+            time.sleep(_LOCK_POLL_INTERVAL_SECONDS)
+
+    def _acquire_operation_lock(self):
+        deadline = time.monotonic() + _SQLITE_TIMEOUT_SECONDS
+        while True:
+            handle = self._open_operation_lock_file()
+            if self._try_lock_operation_file(handle):
+                return handle
+            handle.close()
+            if time.monotonic() >= deadline:
+                raise sqlite3.OperationalError("任务数据库备份或恢复正在进行中。")
+            time.sleep(_LOCK_POLL_INTERVAL_SECONDS)
+
+    def _open_operation_lock_file(self):
+        lock_path = self._operation_lock_path()
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+b")
+        if lock_path.stat().st_size == 0:
+            handle.write(b"0")
+            handle.flush()
+        return handle
+
+    @staticmethod
+    def _try_lock_operation_file(handle) -> bool:
+        if os.name == "nt":
+            import msvcrt
+
+            try:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                return False
+            return True
+        import fcntl
+
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        return True
+
+    @staticmethod
+    def _unlock_operation_file(handle) -> None:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            return
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    @staticmethod
+    def _database_uri(path: Path, *, mode: str) -> str:
+        return f"{Path(path).resolve().as_uri()}?mode={mode}"
 
     def _database_files(self) -> tuple[Path, Path, Path]:
         return (
