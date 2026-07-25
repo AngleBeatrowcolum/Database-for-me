@@ -343,6 +343,24 @@ class ReminderRepository:
                 ),
             )
 
+    def disable_deadline_rules_for_task(
+        self,
+        task_id: str,
+        now: datetime,
+        connection: sqlite3.Connection | None = None,
+    ) -> None:
+        """停用任务的截止时间规则，同时保留规则与投递历史。"""
+
+        with _write_connection(self._database, connection) as active_connection:
+            active_connection.execute(
+                """
+                UPDATE reminder_rules
+                SET enabled = 0, updated_at = ?
+                WHERE task_id = ? AND kind = ?
+                """,
+                (to_utc_text(now), task_id, ReminderKind.DEADLINE_OFFSET.value),
+            )
+
     def claim_due_deliveries(
         self,
         channel: DeliveryChannel,

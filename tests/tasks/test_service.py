@@ -5,8 +5,8 @@ from datetime import date, timedelta
 
 import pytest
 
-from app.tasks.errors import ConfirmationRequired, TaskAssistantError
-from app.tasks.models import DeliveryStatus, Priority, TaskStatus, to_utc_text
+from app.tasks.errors import ConfirmationRequired
+from app.tasks.models import DeliveryChannel, DeliveryStatus, Priority, TaskStatus, to_utc_text
 from app.tasks.repository import ReminderRepository, TaskRepository
 from app.tasks.service import (
     AmbiguousTaskReferenceError,
@@ -182,10 +182,18 @@ def test_update_rebuilds_future_deadline_reminders_and_clears_archive(
             "SELECT before_json, after_json FROM task_events WHERE task_id = ? AND event_type = 'updated'",
             (task.id,),
         ).fetchone()
+        enabled = [
+            row["enabled"]
+            for row in connection.execute(
+                "SELECT enabled FROM reminder_rules WHERE task_id = ? ORDER BY created_at, id",
+                (task.id,),
+            )
+        ]
     assert {
         (row["occurrence_status"], row["delivery_status"])
         for row in old_occurrences
     } == {("cancelled", "skipped")}
+    assert enabled == [0, 0, 1, 1]
     # The event preserves meaningful before/after snapshots instead of only a status marker.
     assert json.loads(event["before_json"])["title"] == "待更新"
     assert json.loads(event["after_json"])["title"] == "已更新"
@@ -218,15 +226,77 @@ def test_complete_cancel_and_reopen_coordinate_status_and_pending_reminders(
                 (task.id,),
             )
         ) == {DeliveryStatus.SKIPPED.value}
+        assert {
+            row["enabled"]
+            for row in connection.execute(
+                "SELECT enabled FROM reminder_rules WHERE task_id = ?", (task.id,)
+            )
+        } == {0}
 
     reopened = service.reopen_task(task.id, now=fixed_now + timedelta(minutes=2))
     assert reopened.status is TaskStatus.PENDING
     assert reopened.completed_at is None
     assert _task_rows(task_database, task.id)["rules"] == 4
+    with task_database.connect() as connection:
+        assert [
+            row["enabled"]
+            for row in connection.execute(
+                "SELECT enabled FROM reminder_rules WHERE task_id = ? ORDER BY created_at, id",
+                (task.id,),
+            )
+        ] == [0, 0, 1, 1]
 
     cancelled = service.cancel_task(task.id, now=fixed_now + timedelta(minutes=3))
     assert cancelled.status is TaskStatus.CANCELLED
     assert cancelled.cancelled_at == fixed_now + timedelta(minutes=3)
+    with task_database.connect() as connection:
+        assert {
+            row["enabled"]
+            for row in connection.execute(
+                "SELECT enabled FROM reminder_rules WHERE task_id = ?", (task.id,)
+            )
+        } == {0}
+
+
+def test_replacing_deadline_rules_preserves_sent_and_cancelled_history(
+    service, task_database, fixed_now
+) -> None:
+    task = service.create_task("保留历史", due_at=fixed_now + timedelta(days=2), now=fixed_now)
+    delivery = service.reminders.claim_due_deliveries(
+        DeliveryChannel.EMAIL, fixed_now + timedelta(days=1), 1
+    )[0]
+    assert service.reminders.mark_delivery_sent(
+        delivery.id, delivery.claim_token, fixed_now + timedelta(days=1)
+    ) is True
+
+    service.update_task(
+        task.id,
+        due_at=fixed_now + timedelta(days=3),
+        now=fixed_now + timedelta(days=1, minutes=1),
+    )
+
+    with task_database.connect() as connection:
+        sent = connection.execute(
+            "SELECT status FROM notification_deliveries WHERE id = ?", (delivery.id,)
+        ).fetchone()
+        old_rules = connection.execute(
+            """
+            SELECT enabled FROM reminder_rules
+            WHERE task_id = ? AND created_at = ?
+            ORDER BY id
+            """,
+            (task.id, to_utc_text(fixed_now)),
+        ).fetchall()
+        old_occurrences = connection.execute(
+            """
+            SELECT status FROM reminder_occurrences
+            WHERE task_id = ? AND created_at = ?
+            """,
+            (task.id, to_utc_text(fixed_now)),
+        ).fetchall()
+    assert sent["status"] == DeliveryStatus.SENT.value
+    assert [row["enabled"] for row in old_rules] == [0, 0]
+    assert {row["status"] for row in old_occurrences} == {"cancelled"}
 
 
 def test_rejects_invalid_state_transitions_with_domain_error(service, fixed_now) -> None:
@@ -244,14 +314,30 @@ def test_resolve_task_requires_unique_exact_title_and_reports_missing(service, f
     assert service.resolve_task("唯一标题") == only
     assert service.resolve_task(only.id) == only
 
-    service.create_task("重复标题", now=fixed_now)
-    service.create_task("重复标题", now=fixed_now + timedelta(seconds=1))
-    with pytest.raises(AmbiguousTaskReferenceError, match="不唯一"):
+    first_duplicate = service.create_task(
+        "重复标题", due_at=fixed_now + timedelta(days=1), now=fixed_now
+    )
+    second_duplicate = service.create_task(
+        "重复标题",
+        due_at=fixed_now + timedelta(days=2),
+        now=fixed_now + timedelta(seconds=1),
+    )
+    with pytest.raises(AmbiguousTaskReferenceError, match="不唯一") as read_error:
         service.resolve_task("重复标题")
+    assert isinstance(read_error.value.candidates, tuple)
+    assert set(read_error.value.candidates) == {first_duplicate, second_duplicate}
+    assert {
+        (task.id, task.title, task.due_at)
+        for task in read_error.value.candidates
+    } == {
+        (first_duplicate.id, "重复标题", fixed_now + timedelta(days=1)),
+        (second_duplicate.id, "重复标题", fixed_now + timedelta(days=2)),
+    }
     with pytest.raises(TaskNotFoundError, match="任务不存在"):
         service.resolve_task("不存在")
-    with pytest.raises(TaskAssistantError):
+    with pytest.raises(AmbiguousTaskReferenceError) as write_error:
         service.complete_task("重复标题", now=fixed_now + timedelta(seconds=2))
+    assert write_error.value.candidates == read_error.value.candidates
 
 
 def test_create_rolls_back_task_events_rules_occurrences_and_deliveries_on_failure(
@@ -347,3 +433,12 @@ def test_write_operation_resolves_its_task_after_entering_immediate_transaction(
     completed = service.complete_task(task.id, now=fixed_now + timedelta(seconds=1))
 
     assert completed.status is TaskStatus.COMPLETED
+
+
+def test_query_today_delegates_to_today_query_service(service, fixed_now) -> None:
+    service.create_task("今日接口", planned_date="2026-07-25", now=fixed_now)
+
+    result = service.query_today(fixed_now)
+
+    assert result.summary.total == 1
+    assert [task.title for task in result.planned_today] == ["今日接口"]

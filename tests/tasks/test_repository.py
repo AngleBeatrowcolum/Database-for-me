@@ -400,3 +400,38 @@ def _occurrences_for_rules(task_database, rule_ids: set[str]):
             f"SELECT id FROM reminder_occurrences WHERE rule_id IN ({placeholders})",
             tuple(rule_ids),
         ).fetchall()
+
+
+def test_disable_deadline_rules_uses_caller_transaction_and_keeps_other_rules(
+    task_database, fixed_now
+) -> None:
+    tasks = TaskRepository(task_database)
+    reminders = ReminderRepository(task_database)
+    task = Task.new("停用规则", now=fixed_now, due_at=fixed_now + timedelta(days=1))
+    tasks.insert(task, event_type="created")
+    deadline = reminders.create_deadline_rule(task, -7200, fixed_now)
+    one_time = reminders.create_one_time_rule(
+        "独立提醒", fixed_now + timedelta(hours=1), {DeliveryChannel.DESKTOP}, fixed_now
+    )
+
+    with pytest.raises(RuntimeError, match="rollback"):
+        with task_database.transaction() as connection:
+            reminders.disable_deadline_rules_for_task(
+                task.id, fixed_now + timedelta(minutes=1), connection=connection
+            )
+            raise RuntimeError("rollback")
+    with task_database.connect() as connection:
+        assert connection.execute(
+            "SELECT enabled FROM reminder_rules WHERE id = ?", (deadline.id,)
+        ).fetchone()["enabled"] == 1
+
+    reminders.disable_deadline_rules_for_task(task.id, fixed_now + timedelta(minutes=2))
+    with task_database.connect() as connection:
+        states = {
+            row["id"]: row["enabled"]
+            for row in connection.execute(
+                "SELECT id, enabled FROM reminder_rules WHERE id IN (?, ?)",
+                (deadline.id, one_time.id),
+            )
+        }
+    assert states == {deadline.id: 0, one_time.id: 1}

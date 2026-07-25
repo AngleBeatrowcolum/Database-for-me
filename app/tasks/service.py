@@ -5,12 +5,15 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import replace
 from datetime import date, datetime, timezone, timedelta
-from typing import Callable, Final, TypeAlias
+from typing import TYPE_CHECKING, Callable, Final, TypeAlias
 
 from app.tasks.database import TaskDatabase
 from app.tasks.errors import ConfirmationRequired, TaskAssistantError
 from app.tasks.models import Priority, Task, TaskStatus, ensure_utc, parse_utc
 from app.tasks.repository import ReminderRepository, TaskRepository, _task_from_row
+
+if TYPE_CHECKING:
+    from app.tasks.today_query import TodayQueryResult
 
 
 class TaskNotFoundError(TaskAssistantError):
@@ -19,6 +22,10 @@ class TaskNotFoundError(TaskAssistantError):
 
 class AmbiguousTaskReferenceError(ConfirmationRequired):
     """标题匹配到多个任务，调用方需要提供明确 ID。"""
+
+    def __init__(self, candidates: tuple[Task, ...]) -> None:
+        self.candidates = tuple(candidates)
+        super().__init__("任务标题不唯一，请提供任务 ID。")
 
 
 class InvalidTaskTransitionError(TaskAssistantError):
@@ -93,20 +100,24 @@ class TaskService:
         if by_id is not None:
             return by_id
 
-        task_ids = self._task_ids_with_exact_title(reference)
-        if not task_ids:
+        candidates = self._tasks_with_exact_title(reference)
+        if not candidates:
             raise TaskNotFoundError("任务不存在。")
-        if len(task_ids) != 1:
-            raise AmbiguousTaskReferenceError("任务标题不唯一，请提供任务 ID。")
-        task = self.tasks.get(task_ids[0])
-        if task is None:
-            raise TaskNotFoundError("任务不存在。")
-        return task
+        if len(candidates) != 1:
+            raise AmbiguousTaskReferenceError(candidates)
+        return candidates[0]
 
     def list_pending_tasks(self) -> tuple[Task, ...]:
         """提供今日查询等只读调用使用的待办任务快照。"""
 
         return tuple(self.tasks.list_pending())
+
+    def query_today(self, now: datetime) -> TodayQueryResult:
+        """委托今日查询服务，避免在生命周期服务中复制查询规则。"""
+
+        from app.tasks.today_query import TodayQueryService
+
+        return TodayQueryService(self).query(now)
 
     def update_task(
         self,
@@ -159,6 +170,9 @@ class TaskService:
                 self.reminders.cancel_pending_for_task(
                     before.id, occurred_at, connection=connection
                 )
+                self.reminders.disable_deadline_rules_for_task(
+                    before.id, occurred_at, connection=connection
+                )
             self.tasks.update(
                 updated, event_type="updated", before=before, connection=connection
             )
@@ -181,6 +195,9 @@ class TaskService:
             self.reminders.cancel_pending_for_task(
                 before.id, occurred_at, connection=connection
             )
+            self.reminders.disable_deadline_rules_for_task(
+                before.id, occurred_at, connection=connection
+            )
             self.tasks.update(
                 completed, event_type="completed", before=before, connection=connection
             )
@@ -199,6 +216,9 @@ class TaskService:
                 cancelled_at=occurred_at,
             )
             self.reminders.cancel_pending_for_task(
+                before.id, occurred_at, connection=connection
+            )
+            self.reminders.disable_deadline_rules_for_task(
                 before.id, occurred_at, connection=connection
             )
             self.tasks.update(
@@ -221,6 +241,9 @@ class TaskService:
             self.reminders.cancel_pending_for_task(
                 before.id, occurred_at, connection=connection
             )
+            self.reminders.disable_deadline_rules_for_task(
+                before.id, occurred_at, connection=connection
+            )
             self.tasks.update(
                 reopened, event_type="reopened", before=before, connection=connection
             )
@@ -230,13 +253,13 @@ class TaskService:
     def _now(self, value: datetime | None) -> datetime:
         return ensure_utc(value if value is not None else self._clock())
 
-    def _task_ids_with_exact_title(self, title: str) -> list[str]:
+    def _tasks_with_exact_title(self, title: str) -> tuple[Task, ...]:
         connection = self.database.connect()
         try:
             rows = connection.execute(
-                "SELECT id FROM tasks WHERE title = ? ORDER BY id", (title,)
+                "SELECT * FROM tasks WHERE title = ? ORDER BY id", (title,)
             ).fetchall()
-            return [row["id"] for row in rows]
+            return tuple(_task_from_row(row) for row in rows)
         finally:
             connection.close()
 
@@ -258,7 +281,9 @@ class TaskService:
         if not rows:
             raise TaskNotFoundError("任务不存在。")
         if len(rows) != 1:
-            raise AmbiguousTaskReferenceError("任务标题不唯一，请提供任务 ID。")
+            raise AmbiguousTaskReferenceError(
+                tuple(_task_from_row(row) for row in rows)
+            )
         return _task_from_row(rows[0])
 
     def _create_default_deadline_reminders(
