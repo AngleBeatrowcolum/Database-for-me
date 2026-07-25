@@ -127,7 +127,7 @@ def create_task_tools(
                 "additionalProperties": False,
             },
             handler=lambda arguments: _create_task(task_service, reminder_scheduler, arguments),
-            group="tasks",
+            group="default",
         ),
         Tool(
             name="task_update",
@@ -144,12 +144,16 @@ def create_task_tools(
                     "priority": {"type": "string", "enum": ["high", "normal", "low"]},
                     "planned_date": {"type": ["string", "null"], "description": "YYYY-MM-DD 或 null。"},
                     "due_at": {"type": ["string", "null"], "description": "带时区 ISO 时间或 null。"},
+                    "allow_past_due": {
+                        "type": "boolean",
+                        "description": "仅在用户明确确认时设为 true，以更新为已过期的截止时间。",
+                    },
                 },
                 "required": ["task_ref"],
                 "additionalProperties": False,
             },
             handler=lambda arguments: _update_task(task_service, reminder_scheduler, arguments),
-            group="tasks",
+            group="default",
         ),
         _task_transition_tool(
             "task_complete", "完成任务", task_service, reminder_scheduler, "complete_task"
@@ -175,7 +179,7 @@ def create_task_tools(
                 "additionalProperties": False,
             },
             handler=lambda arguments: _query_tasks(task_service, reminder_scheduler, arguments),
-            group="tasks",
+            group="default",
         ),
     ]
 
@@ -197,14 +201,14 @@ def create_compatibility_task_tools(
                 "additionalProperties": False,
             },
             handler=lambda arguments: _add_todo(task_service, reminder_scheduler, arguments),
-            group="tasks",
+            group="default",
         ),
         Tool(
             name="list_todos",
             description="兼容旧待办工具：列出 SQLite 中未完成任务。",
             parameters={"type": "object", "properties": {}, "additionalProperties": False},
             handler=lambda arguments: _list_todos(task_service, reminder_scheduler, arguments),
-            group="tasks",
+            group="default",
         ),
         Tool(
             name="complete_todo",
@@ -216,7 +220,7 @@ def create_compatibility_task_tools(
                 "additionalProperties": False,
             },
             handler=lambda arguments: _complete_todo(task_service, reminder_scheduler, arguments),
-            group="tasks",
+            group="default",
         ),
         Tool(
             name="add_reminder",
@@ -237,14 +241,14 @@ def create_compatibility_task_tools(
                 "additionalProperties": False,
             },
             handler=lambda arguments: _reminder_action(reminder_scheduler, "add_reminder", arguments),
-            group="tasks",
+            group="default",
         ),
         Tool(
             name="list_reminders",
             description="兼容旧提醒工具：只列出活动的一次性 SQLite 提醒。",
             parameters={"type": "object", "properties": {}, "additionalProperties": False},
             handler=lambda arguments: _reminder_action(reminder_scheduler, "list_reminders", arguments),
-            group="tasks",
+            group="default",
         ),
         Tool(
             name="cancel_reminder",
@@ -256,7 +260,7 @@ def create_compatibility_task_tools(
                 "additionalProperties": False,
             },
             handler=lambda arguments: _reminder_action(reminder_scheduler, "cancel_reminder", arguments),
-            group="tasks",
+            group="default",
         ),
     ]
 
@@ -290,7 +294,11 @@ def _update_task(
     try:
         task = service.update_task(
             _required_text(arguments, "task_ref"),
-            **{key: arguments[key] for key in ("title", "details", "priority", "planned_date", "due_at") if key in arguments},
+            **{
+                key: arguments[key]
+                for key in ("title", "details", "priority", "planned_date", "due_at", "allow_past_due")
+                if key in arguments
+            },
         )
     except (TaskAssistantError, TypeError, ValueError) as exc:
         _raise_safe_task_error(exc)
@@ -322,7 +330,7 @@ def _task_transition_tool(
             "additionalProperties": False,
         },
         handler=handler,
-        group="tasks",
+        group="default",
     )
 
 

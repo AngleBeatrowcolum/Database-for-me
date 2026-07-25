@@ -45,6 +45,26 @@ def test_task_tool_factory_registers_task_lifecycle_tools(task_database, fixed_n
     }
 
 
+def test_task_entry_tools_are_visible_in_the_first_agent_tool_list(
+    task_database, fixed_now, tmp_path: Path
+) -> None:
+    from app.agent.builtin_tools import create_builtin_tool_registry
+
+    task_service, reminder_scheduler = _services(task_database, fixed_now)
+    registry = create_builtin_tool_registry(
+        tmp_path,
+        task_service=task_service,
+        reminder_scheduler=reminder_scheduler,
+    )
+
+    first_turn_names = {
+        tool["function"]["name"]
+        for tool in registry.describe_openai_tools(active_groups={"default", "mcp", "memory"})
+    }
+
+    assert {"task_create", "task_query", "add_todo", "add_reminder"} <= first_turn_names
+
+
 def test_task_create_complete_and_pending_query_use_task_service(task_database, fixed_now) -> None:
     registry = _registry(task_database, fixed_now)
 
@@ -118,6 +138,35 @@ def test_task_create_can_explicitly_allow_a_past_due_date_without_deadline_remin
             (created.content["task"]["id"],),
         ).fetchone()[0]
     assert count == 0
+
+
+def test_task_update_can_explicitly_allow_a_past_due_date(task_database, fixed_now) -> None:
+    registry = _registry(task_database, fixed_now)
+    created = registry.execute(
+        "task_create",
+        {"title": "将改为过期", "due_at": (fixed_now + timedelta(days=2)).isoformat()},
+    )
+    assert created.success
+    task_id = created.content["task"]["id"]
+    past_due = (fixed_now - timedelta(minutes=1)).isoformat()
+
+    rejected = registry.execute("task_update", {"task_ref": task_id, "due_at": past_due})
+    assert not rejected.success
+    assert "确认" in rejected.error
+
+    updated = registry.execute(
+        "task_update",
+        {"task_ref": task_id, "due_at": past_due, "allow_past_due": True},
+    )
+
+    assert updated.success
+    assert updated.content["task"]["due_at"].startswith("2026-07-25T03:59:00")
+    with task_database.connect() as connection:
+        active_rules = connection.execute(
+            "SELECT COUNT(*) FROM reminder_rules WHERE task_id = ? AND enabled = 1",
+            (task_id,),
+        ).fetchone()[0]
+    assert active_rules == 0
 
 
 def test_sqlite_reminder_adapter_creates_lists_and_cancels_one_time_records(
