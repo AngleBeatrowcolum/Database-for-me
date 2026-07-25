@@ -72,10 +72,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("command", choices=("configure", "register-tasks"))
     parser.add_argument("--base-dir", type=Path, default=_PROJECT_ROOT)
     arguments = parser.parse_args(argv)
+    # Windows 的命令行解析会把带尾部反斜杠的引号参数误读为字面量双引号。
+    # 兼容旧批处理脚本和手动输入，不让它写入错误目录。
+    base_dir = Path(str(arguments.base_dir).rstrip('"'))
     if arguments.command == "configure":
-        _configure(arguments.base_dir)
+        _configure(base_dir)
     else:
-        _register(arguments.base_dir)
+        _register(base_dir)
     return 0
 
 
