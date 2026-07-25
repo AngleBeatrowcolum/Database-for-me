@@ -125,6 +125,25 @@ class StoragePaths:
     def tasks_store(self) -> Path:
         return self._data / "tasks.json"
 
+    # ---- 个人任务助手 ----
+    def tasks_database(self) -> Path:
+        return self._data / "tasks.db"
+
+    def task_assistant_config(self) -> Path:
+        return self.config_dir / "task_assistant.json"
+
+    @property
+    def task_database_backup_dir(self) -> Path:
+        return self._data / "backups" / "sqlite"
+
+    @property
+    def weekly_summary_drafts_dir(self) -> Path:
+        return self._data / "weekly_summary" / "drafts"
+
+    @property
+    def weekly_summary_snapshots_dir(self) -> Path:
+        return self._data / "weekly_summary" / "snapshots"
+
     # ---- 笔记 ----
     @property
     def notes_dir(self) -> Path:
@@ -220,5 +239,8 @@ class StoragePaths:
             self.notes_dir,
             self.tts_cache_dir,
             self.logs_dir,
+            self.task_database_backup_dir,
+            self.weekly_summary_drafts_dir,
+            self.weekly_summary_snapshots_dir,
         ]:
             d.mkdir(parents=True, exist_ok=True)
