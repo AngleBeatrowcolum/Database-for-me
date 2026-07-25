@@ -72,7 +72,7 @@ class TaskAssistantSettings:
             return cls()
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeError, json.JSONDecodeError):
             return cls()
         if not isinstance(data, dict):
             return cls()

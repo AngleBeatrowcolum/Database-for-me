@@ -47,6 +47,15 @@ class NotificationDeliveryStatus(str, Enum):
     SKIPPED = "skipped"
 
 
+class WeeklySummaryStatus(str, Enum):
+    PENDING = "pending"
+    GENERATING = "generating"
+    AWAITING_APPROVAL = "awaiting_approval"
+    PUBLISHING = "publishing"
+    PUBLISHED = "published"
+    CLEANED = "cleaned"
+
+
 def ensure_utc(value: datetime) -> datetime:
     """验证 datetime 带时区并归一化为 UTC。"""
 
@@ -120,6 +129,12 @@ class Task:
         planned_date: date | None = None,
         due_at: datetime | None = None,
     ) -> "Task":
+        if not isinstance(title, str):
+            raise TypeError("任务标题必须是字符串。")
+        if not isinstance(details, str):
+            raise TypeError("任务详情必须是字符串。")
+        if not isinstance(priority, Priority):
+            raise TypeError("任务优先级必须是 Priority。")
         normalized = title.strip()
         if not normalized:
             raise ValueError("任务标题不能为空。")
@@ -207,7 +222,7 @@ class WeeklySummaryRun:
     iso_week: int
     week_start: date
     week_end: date
-    status: str
+    status: WeeklySummaryStatus
     provider: str | None
     snapshot_sha256: str | None
     draft_path: str | None
@@ -220,6 +235,8 @@ class WeeklySummaryRun:
     cleaned_at: datetime | None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.status, WeeklySummaryStatus):
+            raise TypeError("周总结状态必须是 WeeklySummaryStatus。")
         for field_name in (
             "created_at",
             "generated_at",
