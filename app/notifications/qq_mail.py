@@ -60,7 +60,12 @@ class QQMailer:
         message["To"] = self.recipient
         message.set_content(body)
         try:
-            with self._smtp_factory(self.host, self.port, timeout=20) as smtp:
+            with self._smtp_factory(
+                self.host,
+                self.port,
+                timeout=20,
+                local_hostname="sakura.local",
+            ) as smtp:
                 smtp.login(self.sender, authorization_code)
                 smtp.send_message(message)
         except smtplib.SMTPAuthenticationError as exc:
