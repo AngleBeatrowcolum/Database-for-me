@@ -16,3 +16,5 @@ def test_windows_task_xml_is_battery_safe(tmp_path: Path) -> None:
     assert "<WakeToRun>false</WakeToRun>" in xml
     assert "<LogonTrigger>" in xml
     assert "reminder_worker.py" in xml
+    assert "<WorkingDirectory>" in xml
+    assert str((tmp_path / "runtime" / "python.exe").resolve()) in xml

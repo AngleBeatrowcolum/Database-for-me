@@ -15,8 +15,12 @@ def build_reminder_task_xml(
 ) -> str:
     """构建每十分钟运行一次、允许电池且不唤醒设备的计划任务 XML。"""
 
-    command = escape(str(Path(python_exe)))
-    arguments = escape(f'"{Path(worker_path)}" --base-dir "{Path(base_dir)}"')
+    project_dir = Path(base_dir).resolve()
+    python_path = Path(python_exe).resolve()
+    worker = Path(worker_path).resolve()
+    command = escape(str(python_path))
+    arguments = escape(f'"{worker}" --base-dir "{project_dir}"')
+    working_directory = escape(str(project_dir))
     return f'''<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <Triggers>
@@ -38,7 +42,7 @@ def build_reminder_task_xml(
     <ExecutionTimeLimit>PT5M</ExecutionTimeLimit>
     <Enabled>true</Enabled>
   </Settings>
-  <Actions Context="Author"><Exec><Command>{command}</Command><Arguments>{arguments}</Arguments></Exec></Actions>
+  <Actions Context="Author"><Exec><Command>{command}</Command><Arguments>{arguments}</Arguments><WorkingDirectory>{working_directory}</WorkingDirectory></Exec></Actions>
 </Task>'''
 
 

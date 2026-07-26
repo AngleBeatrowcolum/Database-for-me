@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import sys
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 
@@ -13,10 +14,11 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from app.notifications.credentials import KeyringCredentialStore, QQ_SMTP_CREDENTIAL
-from app.platforms.reminder_task import register_reminder_task, write_reminder_task_xml
+from app.platforms.reminder_task import TASK_NAME as REMINDER_TASK_NAME, register_reminder_task, write_reminder_task_xml
 from app.platforms.weekly_summary_task import (
     register_weekly_summary_task,
     build_weekly_summary_task_xml,
+    TASK_NAME as WEEKLY_TASK_NAME,
 )
 from app.storage.paths import StoragePaths
 from app.tasks.backup import DatabaseBackupService
@@ -45,6 +47,7 @@ def _configure(base_dir: Path) -> None:
 
 
 def _register(base_dir: Path) -> None:
+    base_dir = _normalise_base_dir(base_dir)
     config_dir = StoragePaths(base_dir).config_dir
     xml_path = config_dir / "sakura-task-reminder-worker.xml"
     write_reminder_task_xml(
@@ -64,7 +67,18 @@ def _register(base_dir: Path) -> None:
         encoding="utf-16",
     )
     register_weekly_summary_task(weekly_xml)
+    for task_name in (REMINDER_TASK_NAME, WEEKLY_TASK_NAME):
+        subprocess.run(
+            ["schtasks.exe", "/Query", "/TN", task_name, "/FO", "LIST"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
     print("已注册 Sakura 邮件提醒和周总结计划任务。")
+
+
+def _normalise_base_dir(value: Path) -> Path:
+    return Path(str(value).rstrip('"')).resolve()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -74,7 +88,7 @@ def main(argv: list[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     # Windows 的命令行解析会把带尾部反斜杠的引号参数误读为字面量双引号。
     # 兼容旧批处理脚本和手动输入，不让它写入错误目录。
-    base_dir = Path(str(arguments.base_dir).rstrip('"'))
+    base_dir = _normalise_base_dir(arguments.base_dir)
     if arguments.command == "configure":
         _configure(base_dir)
     else:
